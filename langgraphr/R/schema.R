@@ -38,8 +38,12 @@ lg_tool_schema <- function(fn,
                            parameters = NULL) {
   # The tool must be a real function; abort otherwise.
   if (!is.function(fn)) cli::cli_abort("fn must be a function")
-  # Default the tool name to the function's own name.
+  # Default the tool name to the function's own name. When the caller
+  # passed e.g. tools$describe_data, the deparsed expression contains '$',
+  # which OpenAI-style APIs reject (names must match ^[a-zA-Z0-9_-]+$),
+  # so sanitize anything the user might have written.
   if (is.null(name)) name <- deparse(substitute(fn))
+  name <- gsub("[^a-zA-Z0-9_-]", "_", name)
 
   # If the caller did not supply an explicit parameter schema, infer one
   # from the function's formal arguments.

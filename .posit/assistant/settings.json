@@ -1,0 +1,10 @@
+{
+  "permission": {
+    "bash": {
+      "git add *": "allow",
+      "git -c user.name=\"berry\" *": "allow",
+      "git -c http.proxy=http://127.0.0.1:11801 *": "allow",
+      "tail *": "allow"
+    }
+  }
+}

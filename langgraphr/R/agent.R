@@ -38,6 +38,27 @@ lg_connect <- function(port = getOption("langgraphr.port", 8123L),
 
 # ---- LgAgent: quick assistant path ----------------------------------------------
 # LgAgent is an R6 class: it keeps state (port, thread, tools) and methods.
+#' The assistant agent object (quick path)
+#'
+#' Created by [lg_connect()]. Wraps the hidden-server assistant: register
+#' your R functions as tools with `$add_tool()`, chat with `$invoke()`,
+#' and reset memory with `$reset()`.
+#'
+#' @field port Server port.
+#' @field thread_id Memory key for this conversation.
+#' @field tools Named list of registered R tool functions.
+#' @field agent_id Server-side agent type to run.
+#'
+#' @section Methods:
+#' \describe{
+#'   \item{`add_tool(fn, name, description, parameters)`}{Register an R
+#'     function as a tool the model may call.}
+#'   \item{`invoke(input, max_rounds)`}{Send a message and drive the tool
+#'     loop to completion; returns `list(status, content, ...)`.}
+#'   \item{`reset()`}{Start a fresh conversation (new thread id).}
+#' }
+#'
+#' @export
 LgAgent <- R6::R6Class(
   "LgAgent",
   public = list(
@@ -148,6 +169,25 @@ LgAgent <- R6::R6Class(
 
 # ---- LgGraph: full-authoring path ------------------------------------------------
 # LgGraph runs a compiled R-authored graph on the server.
+#' The compiled graph object (full-authoring path)
+#'
+#' Created by [lg_compile()]. Run the graph with `$invoke(input)`, which
+#' services node interrupts by calling your R node functions locally, and
+#' reset memory with `$reset()`.
+#'
+#' @field port Server port.
+#' @field graph_id Server-side id of this graph.
+#' @field thread_id Current memory/run thread.
+#' @field nodes Named list of the R functions behind each node.
+#'
+#' @section Methods:
+#' \describe{
+#'   \item{`invoke(input, thread_id, max_rounds)`}{Run the graph with the
+#'     given input text; returns `list(status, state, ...)`.}
+#'   \item{`reset()`}{Move to a fresh thread.}
+#' }
+#'
+#' @export
 LgGraph <- R6::R6Class(
   "LgGraph",
   public = list(

@@ -147,6 +147,17 @@ test_that("numeric-looking strings become numeric vectors", {
   expect_identical(args$single, "42.5")
 })
 
+test_that("tool names derived from $-access expressions are sanitized", {
+  # Regression: agent$add_tool(tools$describe_data) used to produce the
+  # name "tools$describe_data", which OpenAI-style APIs reject.
+  fn <- function(x) x
+  s <- lg_tool_schema(fn, name = "tools$describe_data")
+  expect_equal(s[["function"]][["name"]], "tools_describe_data")
+  # Explicit clean names pass through unchanged.
+  s2 <- lg_tool_schema(fn, name = "my-tool.2")
+  expect_equal(s2[["function"]][["name"]], "my-tool_2")
+})
+
 test_that("thread ids are unique and prefixed", {
   # Generate several thread ids.
   ids <- replicate(5, lg_thread_id())

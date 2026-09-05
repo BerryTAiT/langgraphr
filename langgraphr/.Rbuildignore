@@ -1,5 +1,7 @@
 ^\.venv$
+^inst/server/\.venv
 ^uv\.lock$
+^inst/server/uv\.lock$
 ^__pycache__$
 ^.*\.pyc$
 ^\.env$
