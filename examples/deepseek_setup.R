@@ -9,24 +9,19 @@
 #   lg_stop_server()                # restart the hidden server with new env
 #   source("examples/quickstart.R")
 #
-# Security: this file contains an API key in plain text. Do not commit it
-# to a public repository; if it leaks, rotate the key in the DeepSeek console.
+# Security: the API key is NOT stored in this file. It is loaded from the
+# git-ignored agent_example/.env file (or set it via .Renviron). If a key
+# ever leaks, rotate it in the DeepSeek console immediately.
 
 # Load the langgraphr package so we can restart the server afterwards.
 library(langgraphr)
 
-# Point the package at the ready-to-use Python venv from this repository.
-# (Change this path if your project lives somewhere else.)
-options(langgraphr.python = "C:/Users/berry/Desktop/creatingWrapper For LangGraph/langgraphr/inst/server/.venv/Scripts/python.exe")
-
-# Set the model id the assistant path will ask DeepSeek to use.
-Sys.setenv(LANGGRAPHR_MODEL = "deepseek-v4-flash")
-
-# Set the API key that authenticates us with DeepSeek.
-Sys.setenv(LANGGRAPHR_API_KEY = "REDACTED-ROTATE-THIS-KEY")
-
-# Set the DeepSeek API base URL. Clean value, no backticks, no quotes inside.
-Sys.setenv(LANGGRAPHR_BASE_URL = "https://api.deepseek.com")
+# Load model credentials from the git-ignored .env file.
+# Create it from the template with your own key:
+#   LANGGRAPHR_MODEL=deepseek-v4-flash
+#   LANGGRAPHR_API_KEY=sk-your-key
+#   LANGGRAPHR_BASE_URL=https://api.deepseek.com
+dotenv::load_dot_env("agent_example/.env")
 
 # Stop any running hidden server so the NEXT start inherits these settings.
 lg_stop_server()
