@@ -152,8 +152,34 @@ lg_tool_schema <- function(fn,
 
 # .lg_coerce_value converts one JSON value to its natural R form.
 .lg_coerce_value <- function(x) {
-  # Scalars and named lists (JSON objects) pass through untouched.
-  if (!is.list(x) || !is.null(names(x))) return(x)
+  # Scalars and named lists (JSON objects) mostly pass through, but a
+  # single string that clearly contains a list of numbers (the model often
+  # sends "1, 2, 3" or "[1, 2, 3]" for a vector argument, because the
+  # inferred schema types unknown arguments as strings) becomes a numeric
+  # vector so vector tools work as written.
+  if (!is.list(x) || !is.null(names(x))) {
+    if (is.character(x) && length(x) == 1L) {
+      trimmed <- trimws(x)
+      # JSON-array-looking string: parse it properly.
+      if (grepl("^\\[.*\\]$", trimmed)) {
+        parsed <- tryCatch(jsonlite::fromJSON(trimmed),
+                           error = function(e) NULL)
+        if (is.atomic(parsed) && !is.character(parsed)) return(as.numeric(parsed))
+        if (is.character(parsed) && !anyNA(suppressWarnings(as.numeric(parsed)))) {
+          return(as.numeric(parsed))
+        }
+      }
+      # Comma/space-separated numbers: split and convert only when EVERY
+      # token is numeric (never mangle ordinary text).
+      tokens <- strsplit(gsub("[,;]+", " ", trimmed), "\\s+")[[1]]
+      tokens <- tokens[nzchar(tokens)]
+      if (length(tokens) > 1L) {
+        nums <- suppressWarnings(as.numeric(tokens))
+        if (!anyNA(nums)) return(nums)
+      }
+    }
+    return(x)
+  }
   # An empty JSON array stays an empty list.
   if (length(x) == 0L) return(x)
   # Are ALL elements objects (named lists)? Then treat as rows of a table.

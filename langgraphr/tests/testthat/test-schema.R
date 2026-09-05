@@ -128,6 +128,25 @@ test_that("proxy values are normalized to URLs", {
   expect_equal(langgraphr:::.lg_normalize_proxy("ftp=x"), "")
 })
 
+test_that("numeric-looking strings become numeric vectors", {
+  # Regression: the model often sends vector arguments as a single string
+  # ("1, 2, 3" or "[1, 2, 3]") because unknown argument types are inferred
+  # as strings; vector tools need real vectors.
+  args <- .lg_coerce_args(list(
+    numbers = "120.5, 340.2, 95, 210.8, 480.1",
+    as_json = "[1, 2, 3]",
+    text = "The quick brown fox",
+    single = "42.5"
+  ))
+  expect_type(args$numbers, "double")
+  expect_equal(args$numbers, c(120.5, 340.2, 95, 210.8, 480.1))
+  expect_equal(args$as_json, c(1, 2, 3))
+  # Ordinary text must stay a string.
+  expect_identical(args$text, "The quick brown fox")
+  # A single scalar string stays a scalar.
+  expect_identical(args$single, "42.5")
+})
+
 test_that("thread ids are unique and prefixed", {
   # Generate several thread ids.
   ids <- replicate(5, lg_thread_id())
