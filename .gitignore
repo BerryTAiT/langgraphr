@@ -1,0 +1,18 @@
+# OS
+Thumbs.db
+.DS_Store
+
+# Python / hidden server runtime
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# R build artifacts
+langgraphr.Rcheck/
+*.tar.gz
+.Rhistory
+.RData
+.Rproj.user/
+build/

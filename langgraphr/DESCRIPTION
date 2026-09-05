@@ -1,0 +1,30 @@
+Package: langgraphr
+Type: Package
+Title: Agentic AI for R, Powered by LangGraph
+Version: 0.3.0
+Authors@R: person("langgraphr", "contributors", role = c("aut", "cre"),
+    email = "dev@example.org")
+Description: Build agentic applications in pure R on top of the LangGraph
+    engine, which runs invisibly as a local background server. Includes a
+    full graph-authoring DSL whose node functions are plain R, a quick
+    assistant path whose tools are plain R functions, thread-based memory,
+    automatic VPN/proxy-resilient networking and a hidden server manager.
+    No Python code is ever written by the user.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.1)
+Imports:
+    R6 (>= 2.5.1),
+    cli (>= 3.6.0),
+    httr2 (>= 1.0.0),
+    jsonlite (>= 1.8.8),
+    processx (>= 3.8.2)
+Suggests:
+    dotenv,
+    duckdb (>= 1.0.0),
+    httpuv (>= 1.6.9),
+    shiny (>= 1.8.0),
+    bslib (>= 0.7.0),
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0
