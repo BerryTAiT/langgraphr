@@ -76,7 +76,7 @@ Then set up the Python server (run once from the repo root):
 LanggraphR/scripts/setup_server.ps1
 ```
 
-See the [full installation guide](articles/installation.html) for details.
+See the [full installation guide](vignettes/installation.Rmd) for details.
 
 ---
 
@@ -111,15 +111,14 @@ cat(result$content)
 
 ## Documentation
 
-- **[Quick Start](articles/quickstart.html)** — get up and running in 5 minutes
-- **[Installation](articles/installation.html)** — prerequisites and setup
-- **[Assistant Agents](articles/assistant-agents.html)** — build LLM agents with R tools
-- **[Graph Authoring](articles/graph-authoring.html)** — custom stateful graphs in pure R
-- **[Memory & Threads](articles/memory-and-threads.html)** — conversation memory and persistence
-- **[Tools & Models](articles/tools-and-models.html)** — tool schemas and direct model calls
-- **[Architecture](articles/architecture.html)** — how it works under the hood
-- **[FAQ & Troubleshooting](articles/faq.html)** — common questions and fixes
-- **[Function Reference](reference/index.html)** — complete API documentation
+- **[Quick Start](vignettes/quickstart.Rmd)** — get up and running in 5 minutes
+- **[Installation](vignettes/installation.Rmd)** — prerequisites and setup
+- **[Assistant Agents](vignettes/assistant-agents.Rmd)** — build LLM agents with R tools
+- **[Graph Authoring](vignettes/graph-authoring.Rmd)** — custom stateful graphs in pure R
+- **[Memory & Threads](vignettes/memory-and-threads.Rmd)** — conversation memory and persistence
+- **[Tools & Models](vignettes/tools-and-models.Rmd)** — tool schemas and direct model calls
+- **[Architecture](vignettes/architecture.Rmd)** — how it works under the hood
+- **[FAQ & Troubleshooting](vignettes/faq.Rmd)** — common questions and fixes
 
 Run `lg_tour()` for an interactive guided tour:
 
@@ -143,7 +142,7 @@ R code  ◄────── HTTP (localhost) ──────►  Python sid
 
 This interrupt-resume pattern is built on LangGraph's native human-in-the-loop feature — R is the "human in the loop."
 
-Learn more in the [Architecture guide](articles/architecture.html).
+Learn more in the [Architecture guide](vignettes/architecture.Rmd).
 
 ---
 
