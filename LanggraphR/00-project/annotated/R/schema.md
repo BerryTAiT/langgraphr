@@ -27,16 +27,31 @@
   "string"
 }
 
-# ---- Tool schema builder ------------------------------------------------------
-# lg_tool_schema converts an R function into an OpenAI-style tool schema.
+#' Convert an R function into an OpenAI tool schema
+#'
+#' Builds the JSON schema the model needs to call an R function. Argument
+#' types are inferred from default values; arguments without defaults are
+#' marked required and typed as strings.
+#'
+#' @param fn The R function to expose as a tool.
+#' @param name Tool name. Defaults to the function's own name.
+#' @param description What the tool does (guidance for the model).
+#' @param parameters An explicit JSON-schema `parameters` object; omit to
+#'   infer the schema from the function's formal arguments.
+#' @return A list in OpenAI tool-schema format.
+#' @export
 lg_tool_schema <- function(fn,
                            name = NULL,
                            description = "",
                            parameters = NULL) {
   # The tool must be a real function; abort otherwise.
   if (!is.function(fn)) cli::cli_abort("fn must be a function")
-  # Default the tool name to the function's own name.
+  # Default the tool name to the function's own name. When the caller
+  # passed e.g. tools$describe_data, the deparsed expression contains '$',
+  # which OpenAI-style APIs reject (names must match ^[a-zA-Z0-9_-]+$),
+  # so sanitize anything the user might have written.
   if (is.null(name)) name <- deparse(substitute(fn))
+  name <- gsub("[^a-zA-Z0-9_-]", "_", name)
 
   # If the caller did not supply an explicit parameter schema, infer one
   # from the function's formal arguments.
@@ -75,12 +90,18 @@ lg_tool_schema <- function(fn,
     }
 
     # Assemble the final parameters schema object.
+    # An empty named list serializes as the JSON object {}; an unnamed
+    # empty list would become the array [], which OpenAI rejects.
+    if (length(properties) == 0L) names(properties) <- character(0)
     parameters <- list(
       type = "object",       # the argument container is a JSON object
       properties = properties # one property per function argument
     )
     # Only attach "required" when at least one argument is required.
-    if (length(required) > 0L) parameters$required <- required
+    # I() protects the vector from jsonlite's auto_unbox (used by the HTTP
+    # client), which would otherwise collapse a single-element required
+    # array into a bare string and make the OpenAI API reject the schema.
+    if (length(required) > 0L) parameters$required <- I(required)
   }
 
   # Return the full OpenAI-style tool schema (type = "function").
@@ -123,7 +144,83 @@ lg_tool_schema <- function(fn,
   x
 }
 
-# ---- State schema helpers (used by the graph DSL) -------------------------------
+# ---- Argument coercion -----------------------------------------------------------
+# .lg_coerce_args turns decoded-JSON tool arguments into natural R objects.
+# The model sends JSON arrays; httr2 decodes them as unnamed lists, which
+# breaks R tools that expect vectors or data frames (e.g. products$revenue
+# silently returns NULL). We convert per argument:
+#   unnamed list of objects  -> data frame (one row per object)
+#   unnamed list of scalars  -> atomic vector
+#   scalars / named lists    -> untouched (records stay records)
+.lg_coerce_args <- function(args) {
+  # Nothing to do without arguments.
+  if (is.null(args) || length(args) == 0L) return(args)
+  # Coerce each argument independently, preserving names and order.
+  for (nm in names(args)) {
+    args[[nm]] <- .lg_coerce_value(args[[nm]])
+  }
+  args
+}
+
+# .lg_coerce_value converts one JSON value to its natural R form.
+.lg_coerce_value <- function(x) {
+  # Scalars and named lists (JSON objects) mostly pass through, but a
+  # single string that clearly contains a list of numbers (the model often
+  # sends "1, 2, 3" or "[1, 2, 3]" for a vector argument, because the
+  # inferred schema types unknown arguments as strings) becomes a numeric
+  # vector so vector tools work as written.
+  if (!is.list(x) || !is.null(names(x))) {
+    if (is.character(x) && length(x) == 1L) {
+      trimmed <- trimws(x)
+      # JSON-array-looking string: parse it properly.
+      if (grepl("^\\[.*\\]$", trimmed)) {
+        parsed <- tryCatch(jsonlite::fromJSON(trimmed),
+                           error = function(e) NULL)
+        if (is.atomic(parsed) && !is.character(parsed)) return(as.numeric(parsed))
+        if (is.character(parsed) && !anyNA(suppressWarnings(as.numeric(parsed)))) {
+          return(as.numeric(parsed))
+        }
+      }
+      # Comma/space-separated numbers: split and convert only when EVERY
+      # token is numeric (never mangle ordinary text).
+      tokens <- strsplit(gsub("[,;]+", " ", trimmed), "\\s+")[[1]]
+      tokens <- tokens[nzchar(tokens)]
+      if (length(tokens) > 1L) {
+        nums <- suppressWarnings(as.numeric(tokens))
+        if (!anyNA(nums)) return(nums)
+      }
+    }
+    return(x)
+  }
+  # An empty JSON array stays an empty list.
+  if (length(x) == 0L) return(x)
+  # Are ALL elements objects (named lists)? Then treat as rows of a table.
+  all_objects <- all(vapply(x, function(e) {
+    is.list(e) && !is.null(names(e)) && !identical(names(e), "")
+  }, logical(1)))
+  if (all_objects) {
+    # Align every row to the union of all column names, filling any
+    # missing column with NA, then bind rows into one data frame.
+    cols <- unique(unlist(lapply(x, names)))
+    rows <- lapply(x, function(e) {
+      missing_cols <- setdiff(cols, names(e))
+      if (length(missing_cols) > 0L) {
+        e[missing_cols] <- list(NA)
+      }
+      as.data.frame(e[cols], stringsAsFactors = FALSE)
+    })
+    return(do.call(rbind, rows))
+  }
+  # Mixed nested arrays: recurse into elements that are still arrays.
+  nested <- vapply(x, is.list, logical(1))
+  if (any(nested)) {
+    x[nested] <- lapply(x[nested], .lg_coerce_value)
+  }
+  # Array of scalars: collapse into one atomic vector.
+  unlist(x, recursive = FALSE)
+}
+
+
 # .lg_validate_state checks a user-supplied state spec and fills defaults.
 # Returns a normalised list: field -> list(type, reducer, description).
 .lg_validate_state <- function(state) {

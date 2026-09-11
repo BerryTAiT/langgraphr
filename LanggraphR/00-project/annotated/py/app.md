@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 # uuid creates fresh thread ids on the rare occasions the server does it.
+import re
 import uuid
 
 # FastAPI pieces for the app, request models and error responses.
@@ -95,6 +96,13 @@ def list_graphs():
 @app.post("/tools/register")
 def register_tool(tool: ToolIn):
     """Register an R-only tool schema."""
+    # OpenAI-style APIs require names to match ^[a-zA-Z0-9_-]+$. Sanitize
+    # here so a malformed name from any client can never poison the shared
+    # registry and break every subsequent request for all sessions.
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "_", tool.name) or "tool"
+    if clean != tool.name:
+        print(f"[langgraphr] sanitized tool name '{tool.name}' -> '{clean}'")
+        tool.name = clean
     # Ask the registry to store the schema.
     registry.register_r_tool(tool.name, tool.description, tool.parameters)
     # Confirm success.

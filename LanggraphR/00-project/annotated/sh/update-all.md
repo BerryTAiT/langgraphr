@@ -1,6 +1,6 @@
 # scripts/update_all.ps1
 
-<!-- TARGET: scripts/update_all.ps1 -->
+<!-- TARGET: LanggraphR/scripts/update_all.ps1 -->
 
 > One-command "latest everything" updater: uv, hidden-server Python deps, and
 > the R packages used by langgraphr. Run it whenever you want everything
@@ -11,7 +11,7 @@
 #
 # Layers updated:
 #   1. uv itself            (uv self update)
-#   2. hidden server deps   (uv sync --upgrade inside langgraphr/inst/server)
+#   2. hidden server deps   (uv sync --upgrade inside inst/server)
 #   3. R packages           (R6, httr2, processx, cli, jsonlite, testthat, remotes)
 #
 # Note: this script never edits code; after updating R packages it is still a
@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 # The repository root (two levels up from scripts/).
 $root   = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # The folder containing the hidden Python server.
-$server = Join-Path $root "langgraphr\inst\server"
+$server = Join-Path $root "inst\server"
 
 Write-Host "==> [1/3] Updating uv itself"
 # Self-update uv to the newest release (works when uv is installed).

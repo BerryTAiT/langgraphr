@@ -14,8 +14,15 @@
 #   - in-process (MemorySaver)  -> lost when the server stops
 #   - sqlite (LANGGRAPHR_DB)    -> survives restarts (durable)
 
-# lg_use_sqlite tells the hidden server to persist checkpoints to a SQLite
-# database at db_path. It takes effect the next time the server starts.
+#' Persist conversation memory to SQLite
+#'
+#' Sets `LANGGRAPHR_DB` so the hidden server checkpoints threads to a SQLite
+#' file instead of in-memory storage, making conversations survive server
+#' restarts. Takes effect the next time the server starts.
+#'
+#' @param db_path Path to the SQLite database file.
+#' @return The resolved path, invisibly.
+#' @export
 lg_use_sqlite <- function(db_path) {
   # The path must be a non-empty string.
   if (!is.character(db_path) || length(db_path) != 1L || !nzchar(db_path)) {
@@ -36,9 +43,14 @@ lg_use_sqlite <- function(db_path) {
   invisible(db_path)
 }
 
-# lg_threads lists the thread ids the server currently knows about.
-# This is a helper for maintainers and debugging; normal code just reuses
-# thread ids it already has.
+#' List known thread ids
+#'
+#' Lists every thread id the running server has seen. Useful for debugging
+#' and maintenance; normal code reuses thread ids it already has.
+#'
+#' @param port Port of the running server.
+#' @return A character vector of thread ids.
+#' @export
 lg_threads <- function(port = getOption("langgraphr.port", 8123L)) {
   # Ask the server for every thread id it has seen.
   out <- .lg_get(port, "/threads")
@@ -46,9 +58,14 @@ lg_threads <- function(port = getOption("langgraphr.port", 8123L)) {
   out$threads %||% character(0)
 }
 
-# lg_thread_id is defined in client.R (it is the same generator used by
-# agents and graphs). This alias documents the connection to memory:
-# a "thread" IS the unit of memory in langgraphr.
+#' Generate a fresh thread id (alias of [lg_thread_id])
+#'
+#' A "thread" is the unit of memory in langgraphr. This alias makes the
+#' memory semantics explicit in code: starting a new thread means starting
+#' a fresh conversation.
+#'
+#' @return A new unique thread id.
+#' @export
 lg_new_thread <- function() {
   # Generate and return a brand-new thread id.
   lg_thread_id()

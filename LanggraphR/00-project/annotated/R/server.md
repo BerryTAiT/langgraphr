@@ -91,18 +91,90 @@
   }, error = function(e) FALSE)   # any error quietly means "not healthy yet"
 }
 
-# ---- Start -------------------------------------------------------------------
-# lg_start_server spawns the hidden server and waits until it is ready.
+# ---- System proxy detection --------------------------------------------------
+# .lg_detect_system_proxy finds the machine's outbound proxy without any
+# user configuration: first the standard environment variables, then (on
+# Windows) the system proxy in the registry. This matters because some
+# VPN clients reset Python's TLS connections while R's curl still works;
+# routing the sidecar through the same proxy as R fixes that.
+.lg_detect_system_proxy <- function() {
+  # Standard env vars win (they are cross-platform by definition).
+  p <- Sys.getenv("HTTPS_PROXY", Sys.getenv("https_proxy",
+         Sys.getenv("HTTP_PROXY", Sys.getenv("http_proxy", ""))))
+  # Also honour an explicit langgraphr override.
+  p <- Sys.getenv("LANGGRAPHR_PROXY", unset = p)
+  if (nzchar(p)) return(p)
+  # Windows only: read the system proxy from the user registry.
+  if (.Platform$OS.type == "windows") {
+    tryCatch({
+      en <- utils::readRegistry(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        "HKCU", maxlevel = 1)
+      if (identical(en$ProxyEnable, 1L) && !is.null(en$ProxyServer) &&
+          nzchar(en$ProxyServer)) {
+        .lg_normalize_proxy(en$ProxyServer)
+      } else ""
+    }, error = function(e) "")
+  } else ""
+}
+
+# .lg_normalize_proxy turns a registry ProxyServer value into a URL.
+# It may be "host:port" or per-scheme "http=host:port;https=host:port".
+.lg_normalize_proxy <- function(srv) {
+  # Per-scheme form (contains '='), with or without the semicolons.
+  if (grepl("=", srv)) {
+    m <- regmatches(srv, regexec("https=([^;]+)", srv))[[1]]
+    srv <- if (length(m) > 1) m[2] else {
+      m2 <- regmatches(srv, regexec("http=([^;]+)", srv))[[1]]
+      if (length(m2) > 1) m2[2] else return("")
+    }
+  }
+  # Add the scheme when it is missing.
+  if (!grepl("://", srv)) srv <- paste0("http://", srv)
+  srv
+}
+
+#' Start the hidden LangGraph server
+#'
+#' Spawns the bundled Python/FastAPI sidecar as a supervised background
+#' process and waits until it answers `/health`. Called automatically by
+#' [lg_connect()] and [lg_compile()]; only call it directly to pre-warm the
+#' server or to control the network route.
+#'
+#' @param port Port for the server (default from the `langgraphr.port`
+#'   option, otherwise 8123).
+#' @param wait Wait for the server to become healthy before returning?
+#' @param timeout Seconds to wait for the server to become healthy.
+#' @param logfile Where to write server logs. Defaults to a temp file;
+#'   pass a path to keep the log.
+#' @param proxy Network route for the sidecar's model traffic: `"auto"`
+#'   (detect the system proxy), `"system"` (force the detected proxy) or
+#'   `"direct"` (bypass every proxy).
+#' @param extra_env Named character vector of extra environment variables
+#'   for the sidecar process.
+#' @return The port, invisibly.
+#' @export
 lg_start_server <- function(port = getOption("langgraphr.port", 8123L),
                             wait = TRUE,
                             timeout = getOption("langgraphr.timeout", 60L),
-                            logfile = NULL) {
-  # If a healthy server is already running on this port, do nothing.
+                            logfile = NULL,
+                            proxy = c("auto", "system", "direct"),
+                            extra_env = NULL) {
+  # Validate the requested network route.
+  mode <- match.arg(proxy)
+  # If a healthy server is already running on this port, only restart it
+  # when the caller explicitly asked for a DIFFERENT route than the one
+  # it is currently using.
   if (.lg_healthy(port)) {
-    # Inform the user that the server is already up.
-    cli::cli_alert_success("langgraphr server already running on :{port}")
-    # Return the port invisibly so the call can be piped.
-    return(invisible(port))
+    want <- if (mode == "auto") NULL else mode
+    if (is.null(want) || identical(.lg_env$proxy_mode, want)) {
+      # Inform the user that the server is already up.
+      cli::cli_alert_success("langgraphr server already running on :{port}")
+      # Return the port invisibly so the call can be piped.
+      return(invisible(port))
+    }
+    # Route change requested: replace the running server.
+    lg_stop_server()
   }
 
   # Resolve where the bundled Python server files live.
@@ -136,6 +208,35 @@ lg_start_server <- function(port = getOption("langgraphr.port", 8123L),
   # The child process inherits the current R session environment so model
   # settings (LANGGRAPHR_MODEL etc.) set by the user flow through.
   env <- Sys.getenv()
+
+  # Set the network route for the sidecar. With "auto" we detect the
+  # system proxy (env vars, then the Windows registry); with "direct" we
+  # clear every proxy variable and bypass any VPN-level HTTP proxy; with
+  # "system" we force the detected proxy even if env vars are unset.
+  if (identical(mode, "direct")) {
+    env[c("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")] <- ""
+    env["NO_PROXY"] <- "*"
+    env["no_proxy"] <- "*"
+    .lg_env$proxy_mode <- "direct"
+  } else {
+    sys_proxy <- .lg_detect_system_proxy()
+    if (nzchar(sys_proxy)) {
+      env["HTTP_PROXY"] <- env["HTTPS_PROXY"] <- sys_proxy
+      env["http_proxy"] <- env["https_proxy"] <- sys_proxy
+      # Loopback traffic (the local relay) must always bypass the proxy.
+      env["NO_PROXY"] <- "127.0.0.1,localhost"
+      env["no_proxy"] <- "127.0.0.1,localhost"
+      .lg_env$proxy_mode <- "system"
+    } else {
+      .lg_env$proxy_mode <- "direct"
+    }
+  }
+
+  # Apply caller-supplied environment overrides (used by the automatic
+  # relay fallback to point the sidecar at the local relay).
+  if (!is.null(extra_env)) {
+    env[names(extra_env)] <- extra_env
+  }
 
   # Spawn the hidden server as a supervised background process.
   proc <- processx::process$new(
@@ -183,15 +284,34 @@ lg_start_server <- function(port = getOption("langgraphr.port", 8123L),
   invisible(port)
 }
 
-# ---- Stop ---------------------------------------------------------------------
-# lg_stop_server kills the hidden server process we spawned, if any.
+#' Stop the hidden LangGraph server
+#'
+#' Kills the sidecar process tree at the OS level and clears the stored
+#' handle. Called automatically when the package is unloaded or R exits.
+#'
+#' @return `NULL`, invisibly.
+#' @export
 lg_stop_server <- function() {
   # Read the stored process handle (NULL when nothing was started).
   proc <- .lg_env$proc
-  # Only act when there is a handle and the process is still alive.
-  if (!is.null(proc) && proc$is_alive()) {
-    # Kill the process; wrapped in try so a race cannot break unloading.
-    try(proc$kill(), silent = TRUE)
+  # Only act when there is a handle.
+  if (!is.null(proc)) {
+    # Remember the OS pid before touching the handle.
+    pid <- tryCatch(as.character(proc$get_pid()), error = function(e) NULL)
+    # Kill the process tree (uvicorn children too); wrapped so a race
+    # cannot break unloading.
+    if (proc$is_alive()) try(proc$kill_tree(), silent = TRUE)
+    # Belt and braces: kill at the OS level as well, so the server can
+    # never survive as an orphan holding port 8123 and a stale registry
+    # (which previously happened when only the handle was killed).
+    if (!is.null(pid) && nzchar(pid)) {
+      if (.Platform$OS.type == "windows") {
+        system2("taskkill", c("/PID", pid, "/T", "/F"),
+                stdout = FALSE, stderr = FALSE)
+      } else {
+        system2("kill", c("-9", pid), stdout = FALSE, stderr = FALSE)
+      }
+    }
   }
   # Clear the stored handle so we do not try to kill it twice.
   .lg_env$proc <- NULL

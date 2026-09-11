@@ -1,26 +1,31 @@
 # extract_code.py - generate the real project files from annotated Markdown.
 #
 # Every real source file in this repo is pre-written inside
-# 00-project/annotated/<family>/<name>.md as a fenced code block. Each MD
-# carries an HTML comment that says which file it becomes:
+# LanggraphR/00-project/annotated/<family>/<name>.md as a fenced code block.
+# Each MD carries an HTML comment that says which file it becomes:
 #
-#     <!-- TARGET: langgraphr/R/client.R -->
+#     <!-- TARGET: LanggraphR/R/client.R -->
 #
 # Run this script after editing any annotated MD to regenerate the real files:
 #
-#     python scripts/tools/extract_code.py
+#     python LanggraphR/scripts/tools/extract_code.py
 #
 # Rule (see 00-project/04-file-tree.md): never hand-edit generated files;
-# edit the annotated MD and re-run this script.
+# edit the annotated MD and re-run this script (or sync_annotated.py to go
+# the other way).
 
 # The 'pathlib' module gives us clean cross-platform path handling.
 from pathlib import Path
 
-# repo_root is the folder two levels above this script (scripts/tools/.. = repo).
-repo_root = Path(__file__).resolve().parents[2]
+# repo_root is the folder three levels above this script
+# (LanggraphR/scripts/tools/.. -> LanggraphR, ../.. -> repo root).
+repo_root = Path(__file__).resolve().parents[3]
+
+# pkg_dir is the package folder inside the repository root.
+pkg_dir = repo_root / "LanggraphR"
 
 # annotated_dir is where all the annotated Markdown files live.
-annotated_dir = repo_root / "00-project" / "annotated"
+annotated_dir = pkg_dir / "00-project" / "annotated"
 
 
 def find_target(text: str) -> str | None:
@@ -41,6 +46,23 @@ def find_target(text: str) -> str | None:
     raw = text[pos + len(marker):end].strip()
     # Return the cleaned target path.
     return raw
+
+
+def resolve_target(target: str) -> Path:
+    """Map a TARGET path to its real location in the new folder layout."""
+    # Package files may carry a historical "langgraphr/" or "LanggraphR/"
+    # prefix; the package folder is LanggraphR itself, so strip the prefix.
+    if target.startswith(("langgraphr/", "LanggraphR/")):
+        return pkg_dir / target.split("/", 1)[1]
+    # Build scripts may carry a historical "scripts/" or "projects/scripts/"
+    # prefix; they now live at LanggraphR/scripts.
+    if target.startswith(("scripts/", "projects/scripts/")):
+        rest = (target.split("/", 1)[1]
+                if target.startswith("scripts/")
+                else target[len("projects/scripts/"):])
+        return pkg_dir / "scripts" / rest
+    # Anything else is relative to the repository root.
+    return repo_root / target
 
 
 def extract_code_block(text: str) -> str:
@@ -74,8 +96,8 @@ def main() -> None:
         # Skip MD files that are not code carriers (no TARGET marker).
         if target is None:
             continue
-        # Compute the absolute output path under the repository root.
-        out_path = repo_root / target
+        # Compute the absolute output path in the current folder layout.
+        out_path = resolve_target(target)
         # Extract the fenced code block content.
         code = extract_code_block(text)
         # Create every parent directory of the output file.
@@ -83,7 +105,7 @@ def main() -> None:
         # Write the extracted code to the real file location.
         out_path.write_text(code, encoding="utf-8")
         # Announce what we generated.
-        print(f"generated {target}")
+        print(f"generated {out_path.relative_to(repo_root)}")
         # Count this file.
         generated += 1
     # Print the total number of files generated.

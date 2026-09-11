@@ -11,7 +11,7 @@ $PSScriptRootPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 # The repository root (one level above scripts/).
 $root   = Split-Path -Parent $PSScriptRootPath
 # The server bundle folder that holds the python sources.
-$server = Join-Path $root "langgraphr\inst\server"
+$server = Join-Path $root "inst\server"
 
 # Tell the user which folder we are setting up.
 Write-Host "Setting up server bundle at: $server"

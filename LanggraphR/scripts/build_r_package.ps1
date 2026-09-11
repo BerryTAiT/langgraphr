@@ -1,11 +1,3 @@
-# scripts/build_r_package.ps1
-
-<!-- TARGET: scripts/build_r_package.ps1 -->
-
-> Build and install the R package (`R CMD build` + `R CMD INSTALL`).
-> Requires R >= 4.1 on the PATH.
-
-```powershell
 # build_r_package.ps1 - build and install the langgraphr R package.
 #
 # Runs the standard R toolchain. After this, `library(langgraphr)` works.
@@ -24,10 +16,10 @@ if (-not (Get-Command Rscript -ErrorAction SilentlyContinue)) {
 $Rbin = Split-Path -Parent (Get-Command Rscript).Source
 # The full path to R.exe.
 $Rexe = Join-Path $Rbin "R.exe"
-# The repository root (one level above scripts/).
+# The package root (one level above scripts/, which is LanggraphR itself).
 $root = Split-Path -Parent $PSScriptRoot
 # The R package source folder.
-$pkg  = Join-Path $root "langgraphr"
+$pkg  = $root
 
 # Announce the build step.
 Write-Host "==> R CMD build"
@@ -49,4 +41,3 @@ Write-Host "==> R CMD INSTALL $($tarball.Name)"
 
 # Tell the user it worked and how to use the package.
 Write-Host "Done. Try in R:  library(langgraphr)"
-```

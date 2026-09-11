@@ -1,3 +1,11 @@
+# scripts/run_server_dev.ps1
+
+<!-- TARGET: LanggraphR/scripts/run_server_dev.ps1 -->
+
+> Run the hidden server in the FOREGROUND for debugging (logs visible).
+> Normal users never need this: the R package spawns the server itself.
+
+```powershell
 # run_server_dev.ps1 - start the langgraphr server in the foreground.
 #
 # Development/debugging aid. The R package normally starts this process
@@ -9,7 +17,7 @@ $ErrorActionPreference = "Stop"
 # Resolve the repository root from this script's location.
 $root   = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # The server bundle folder that contains app.py.
-$server = Join-Path $root "langgraphr\inst\server"
+$server = Join-Path $root "inst\server"
 # The port to listen on (first argument, default 8123).
 $port   = if ($args.Count -gt 0) { $args[0] } else { "8123" }
 
@@ -37,3 +45,4 @@ finally {
     # Always return to the original working directory.
     Pop-Location
 }
+```

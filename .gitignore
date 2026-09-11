@@ -10,7 +10,7 @@ venv/
 .env
 
 # R build artifacts
-langgraphr.Rcheck/
+LanggraphR.Rcheck/
 *.tar.gz
 .Rhistory
 .RData

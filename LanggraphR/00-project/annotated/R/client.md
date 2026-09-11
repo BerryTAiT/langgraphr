@@ -18,6 +18,20 @@
 # built-in operator for this, so we define our own.
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0L) y else x
 
+# .lg_name_empty_lists recursively gives every empty list empty names so
+# jsonlite serializes it as a JSON object rather than a JSON array. This
+# matters for schemas like "properties": {} and "parameters": {}.
+.lg_name_empty_lists <- function(x) {
+  # Recurse into named lists only (atomic values and NULL are untouched).
+  if (is.list(x)) {
+    # Convert children first, so empty containers deep inside get fixed.
+    x[] <- lapply(x, .lg_name_empty_lists)
+    # An empty list (named or not) becomes an empty-named list -> {}.
+    if (length(x) == 0L) names(x) <- character(0)
+  }
+  x
+}
+
 # ---- URL construction ------------------------------------------------------
 # .lg_url builds the full URL for one server endpoint.
 # port = server port, path = endpoint path starting with "/".
@@ -41,6 +55,9 @@
   req <- httr2::req_error(req, is_error = function(resp) FALSE)
   # If the caller supplied a body, attach it as a JSON request body.
   if (!is.null(body)) {
+    # Give empty lists explicit empty names so they serialize as JSON
+    # objects ({}) rather than arrays ([]), which strict APIs reject.
+    body <- .lg_name_empty_lists(body)
     req <- httr2::req_body_json(req, body, auto_unbox = TRUE)
   }
   # Return the fully-built request object.
@@ -68,13 +85,68 @@
                       collapse = "; ")
     }
     # Raise an R error; this message is what the user actually sees.
+    # Interpolating detail via {detail} prevents cli from treating the
+    # server's braces (e.g. JSON dicts) as inline-markup expressions.
     cli::cli_abort(c(
       "langgraphr server error ({status}) on {path}",
-      "x" = as.character(detail)
+      "x" = "{detail}"
     ))
   }
   # Return the parsed response as an R list.
   out
+}
+
+# ---- Connection-error recovery ------------------------------------------------
+# .lg_perform_retrying performs a request and, when the sidecar lost its
+# route to the LLM API (VPN state changes, TLS resets), restarts the
+# hidden server on the ALTERNATE network route ("direct" <-> "system
+# proxy") and retries. This makes the package work whether the user's
+# VPN is on or off, on Windows, macOS and Linux.
+.lg_perform_retrying <- function(port, path, body = NULL, max_retries = 2L) {
+  # Attempt counter for the recovery loop.
+  tries <- 0L
+  repeat {
+    # Either the parsed response or the caught error.
+    res <- tryCatch(
+      list(value = .lg_perform(port, path, body)),
+      error = function(e) list(err = e)
+    )
+    # Success: return immediately.
+    if (is.null(res$err)) return(res$value)
+    # Give up on non-connection errors or once retries are exhausted.
+    msg <- conditionMessage(res$err)
+    is_conn <- grepl("connection|10054|timed out|ConnectError|reset",
+                     msg, ignore.case = TRUE)
+    if (!is_conn || tries >= max_retries) {
+      # Last resort before giving up: relay the sidecar's LLM traffic
+      # through THIS R process, whose curl stack uses the OS TLS and
+      # works even when VPN rules reset Python's connections. Fully
+      # automatic - the user never configures anything.
+      if (is_conn) {
+        base <- Sys.getenv("LANGGRAPHR_BASE_URL", unset = "https://api.openai.com/v1")
+        relay_url <- .lg_start_relay(base)
+        cli::cli_alert_warning(paste0(
+          "Model connection failed on every route; forwarding model ",
+          "traffic through a local R relay (automatic, no setup needed)."
+        ))
+        lg_stop_server()
+        lg_start_server(port = port, proxy = "direct", extra_env = c(
+          LANGGRAPHR_BASE_URL = relay_url,
+          NO_PROXY = "*", no_proxy = "*"
+        ))
+        next
+      }
+      stop(res$err)
+    }
+    # Alternate the network route and restart the sidecar.
+    tries <- tries + 1L
+    nxt <- if (identical(.lg_env$proxy_mode, "system")) "direct" else "system"
+    cli::cli_alert_warning(paste0(
+      "Model connection failed; retrying via the '{nxt}' network route..."
+    ))
+    lg_stop_server()
+    lg_start_server(port = port, proxy = nxt)
+  }
 }
 
 # ---- GET + error handling --------------------------------------------------
@@ -94,9 +166,14 @@
   out
 }
 
-# ---- Thread ids ------------------------------------------------------------
-# lg_thread_id generates a unique thread id. Thread ids are the memory key:
-# reusing one id continues a conversation on the server's checkpointer.
+#' Generate a unique thread id
+#'
+#' Thread ids are the unit of memory in langgraphr: reusing one continues a
+#' conversation on the server's checkpointer. Each new id starts a fresh
+#' conversation.
+#'
+#' @return A character scalar like `"thread_20260905130953_7z1pa0"`.
+#' @export
 lg_thread_id <- function() {
   # stamp = current time without separators, e.g. "20260904153012".
   stamp <- format(Sys.time(), "%Y%m%d%H%M%S")
@@ -106,9 +183,23 @@ lg_thread_id <- function() {
   paste0("thread_", stamp, "_", rand)
 }
 
-# ---- R-native model helper ------------------------------------------------
-# lg_call_model calls any OpenAI-compatible chat-completions API from R.
-# This lets R graph nodes talk to an LLM directly (no Python involved).
+#' Call an OpenAI-compatible chat model directly from R
+#'
+#' Sends a chat-completions request from R itself (no Python involved), so R
+#' graph nodes and tools can use an LLM without leaving the process.
+#'
+#' @param messages A list of message lists, each with `role` and `content`.
+#' @param model Model name. Defaults to `LANGGRAPHR_MODEL`, else
+#'   "gpt-4o-mini".
+#' @param base_url API base URL. Defaults to `LANGGRAPHR_BASE_URL`, else
+#'   OpenAI's endpoint.
+#' @param api_key API key. Defaults to `LANGGRAPHR_API_KEY`, then
+#'   `OPENAI_API_KEY`.
+#' @param temperature Optional sampling temperature.
+#' @param max_tokens Optional maximum number of tokens to generate.
+#' @param timeout Request timeout in seconds.
+#' @return The assistant's reply text (character scalar).
+#' @export
 lg_call_model <- function(messages,
                           model = NULL,
                           base_url = NULL,

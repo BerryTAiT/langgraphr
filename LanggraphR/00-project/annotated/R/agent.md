@@ -18,8 +18,25 @@
 # Both work over the same HTTP contract and the same idea: when the server
 # needs R code, it interrupts the run and we resume after running it.
 
-# ---- Connect ------------------------------------------------------------------
-# lg_connect starts the hidden server (if needed) and returns an LgAgent.
+#' Connect to the hidden LangGraph server (assistant path)
+#'
+#' Starts the hidden Python server if it is not already running and returns
+#' an [LgAgent]: a bundled assistant whose tools are plain R functions you
+#' register with `$add_tool()`. Conversation memory is keyed by `thread_id`.
+#'
+#' @param port Port for the hidden server (default from the
+#'   `langgraphr.port` option, otherwise 8123).
+#' @param thread_id Reuse an existing thread id to continue a conversation;
+#'   `NULL` generates a fresh one.
+#' @return An [LgAgent] object.
+#' @examples
+#' \dontrun{
+#' agent <- lg_connect()
+#' agent$add_tool(my_function, description = "What my_function does")
+#' res <- agent$invoke("Hello!")
+#' res$content
+#' }
+#' @export
 lg_connect <- function(port = getOption("langgraphr.port", 8123L),
                        thread_id = NULL) {
   # Make sure the hidden server is running before we build an agent.
@@ -30,6 +47,27 @@ lg_connect <- function(port = getOption("langgraphr.port", 8123L),
 
 # ---- LgAgent: quick assistant path ----------------------------------------------
 # LgAgent is an R6 class: it keeps state (port, thread, tools) and methods.
+#' The assistant agent object (quick path)
+#'
+#' Created by [lg_connect()]. Wraps the hidden-server assistant: register
+#' your R functions as tools with `$add_tool()`, chat with `$invoke()`,
+#' and reset memory with `$reset()`.
+#'
+#' @field port Server port.
+#' @field thread_id Memory key for this conversation.
+#' @field tools Named list of registered R tool functions.
+#' @field agent_id Server-side agent type to run.
+#'
+#' @section Methods:
+#' \describe{
+#'   \item{`add_tool(fn, name, description, parameters)`}{Register an R
+#'     function as a tool the model may call.}
+#'   \item{`invoke(input, max_rounds)`}{Send a message and drive the tool
+#'     loop to completion; returns `list(status, content, ...)`.}
+#'   \item{`reset()`}{Start a fresh conversation (new thread id).}
+#' }
+#'
+#' @export
 LgAgent <- R6::R6Class(
   "LgAgent",
   public = list(
@@ -85,11 +123,13 @@ LgAgent <- R6::R6Class(
 
     # invoke sends one message and drives the tool loop to completion.
     invoke = function(input, max_rounds = 10L) {
-      # POST a new run on this thread with the user's message.
-      result <- .lg_perform(self$port,
-                            paste0("/threads/", self$thread_id, "/runs"),
-                            list(input = as.character(input),
-                                 agent = self$agent_id))
+      # POST a new run on this thread; recovery restarts the sidecar on
+      # an alternate route (direct <-> system proxy) on connection errors.
+      result <- .lg_perform_retrying(
+        self$port,
+        paste0("/threads/", self$thread_id, "/runs"),
+        list(input = as.character(input),
+             agent = self$agent_id))
       # Count how many tool rounds we have done (safety cap).
       rounds <- 0L
       # Keep looping while the server asks us to run R tools.
@@ -108,13 +148,15 @@ LgAgent <- R6::R6Class(
           if (is.null(fn)) {
             cli::cli_abort("Server requested unknown tool '{ic$name}'.")
           }
-          # Decode the arguments (already an R list from JSON parsing).
+          # Decode the arguments (already an R list from JSON parsing) and
+          # coerce JSON arrays into natural R forms (vectors, data frames).
           args <- if (is.null(ic$args)) list() else ic$args
+          args <- .lg_coerce_args(args)
           # Call the R function and make the result JSON-safe.
           .lg_prep_result(.lg_call_tool(fn, args))
         })
         # Resume the interrupted run with the tool results.
-        result <- .lg_perform(
+        result <- .lg_perform_retrying(
           self$port,
           paste0("/threads/", self$thread_id, "/resume"),
           list(value = list(results = values))
@@ -136,6 +178,25 @@ LgAgent <- R6::R6Class(
 
 # ---- LgGraph: full-authoring path ------------------------------------------------
 # LgGraph runs a compiled R-authored graph on the server.
+#' The compiled graph object (full-authoring path)
+#'
+#' Created by [lg_compile()]. Run the graph with `$invoke(input)`, which
+#' services node interrupts by calling your R node functions locally, and
+#' reset memory with `$reset()`.
+#'
+#' @field port Server port.
+#' @field graph_id Server-side id of this graph.
+#' @field thread_id Current memory/run thread.
+#' @field nodes Named list of the R functions behind each node.
+#'
+#' @section Methods:
+#' \describe{
+#'   \item{`invoke(input, thread_id, max_rounds)`}{Run the graph with the
+#'     given input text; returns `list(status, state, ...)`.}
+#'   \item{`reset()`}{Move to a fresh thread.}
+#' }
+#'
+#' @export
 LgGraph <- R6::R6Class(
   "LgGraph",
   public = list(
@@ -166,11 +227,12 @@ LgGraph <- R6::R6Class(
     invoke = function(input, thread_id = NULL, max_rounds = 100L) {
       # Allow an explicit thread id per call (overrides the stored one).
       if (!is.null(thread_id)) self$thread_id <- thread_id
-      # POST a run of this graph on the thread.
-      result <- .lg_perform(self$port,
-                            paste0("/threads/", self$thread_id, "/runs"),
-                            list(input = as.character(input),
-                                 agent = self$graph_id))
+      # POST a run of this graph on the thread (with connection recovery).
+      result <- .lg_perform_retrying(
+        self$port,
+        paste0("/threads/", self$thread_id, "/runs"),
+        list(input = as.character(input),
+             agent = self$graph_id))
       # Count interrupt-service rounds (safety cap).
       rounds <- 0L
       # Service interrupts until the graph run completes.
@@ -208,7 +270,7 @@ LgGraph <- R6::R6Class(
         # Extract the optional state updates (may be NULL/empty).
         updates <- out$updates %||% list()
         # Resume the graph with exactly the reply shape the bridge expects.
-        result <- .lg_perform(
+        result <- .lg_perform_retrying(
           self$port,
           paste0("/threads/", self$thread_id, "/resume"),
           list(value = list(reply = list(goto = goto, updates = updates)))

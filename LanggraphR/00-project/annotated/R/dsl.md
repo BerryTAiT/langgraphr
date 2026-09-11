@@ -20,7 +20,24 @@
 #   list(updates = list(...), goto = "node_id" or "__end__" or NULL)
 # This keeps every piece of agent logic in R.
 
-# lg_graph starts a new graph builder object.
+#' Start a new agent graph (full-authoring path)
+#'
+#' Creates a graph builder whose nodes are plain R functions. When compiled
+#' with [lg_compile()], the flow between nodes is orchestrated by the hidden
+#' LangGraph server while every node body executes in R.
+#'
+#' @param id A unique name for the graph, used as its server-side id.
+#' @param state A named list describing the state channels. Each entry is a
+#'   list with fields `type` ("str", "number", "boolean", "list" or "any"),
+#'   `reducer` ("overwrite" or "append") and an optional `description`.
+#' @param entry The id of the entry node. Defaults to the first node added.
+#' @return A graph builder object (class `lg_graph_builder`) for use with
+#'   [lg_add_node()], [lg_add_edge()] and [lg_compile()].
+#' @examples
+#' \dontrun{
+#' g <- lg_graph("demo", state = list(count = list(type = "number")))
+#' }
+#' @export
 lg_graph <- function(id, state = list(), entry = NULL) {
   # The graph id must be a simple string (used as server-side agent id).
   if (!is.character(id) || length(id) != 1L || !nzchar(id)) {
@@ -45,7 +62,18 @@ lg_graph <- function(id, state = list(), entry = NULL) {
   )
 }
 
-# lg_add_node attaches one node (an R function) to the graph builder.
+#' Add a node (an R function) to a graph
+#'
+#' Registers an R function as a node of the graph. The function receives the
+#' current state and returns `list(updates = list(...), goto = "node_id")`;
+#' a `goto` of `"__end__"` (or NULL with no default edge) finishes the run.
+#'
+#' @param builder A graph builder from [lg_graph()].
+#' @param id A unique node id within the graph.
+#' @param fn The R function implementing the node body.
+#' @param description Optional text describing the node (stored in the spec).
+#' @return The builder, invisibly, for piping with `|>`.
+#' @export
 lg_add_node <- function(builder, id, fn, description = "") {
   # The node id must be a non-empty string.
   if (!is.character(id) || length(id) != 1L || !nzchar(id)) {
@@ -67,8 +95,16 @@ lg_add_node <- function(builder, id, fn, description = "") {
   invisible(builder)
 }
 
-# lg_add_edge declares a DEFAULT edge from -> to.
-# The default edge is followed when a node returns no goto.
+#' Add a default edge between two nodes
+#'
+#' Declares the default successor of a node, followed when the node returns
+#' no `goto`.
+#'
+#' @param builder A graph builder from [lg_graph()].
+#' @param from The source node id (must already exist).
+#' @param to The target node id (must already exist).
+#' @return The builder, invisibly, for piping with `|>`.
+#' @export
 lg_add_edge <- function(builder, from, to) {
   # Both endpoints must exist as nodes already.
   if (!from %in% names(builder$nodes)) cli::cli_abort("unknown node '{from}'")
@@ -81,9 +117,16 @@ lg_add_edge <- function(builder, from, to) {
   invisible(builder)
 }
 
-# lg_set_memory attaches optional persistence configuration to a graph.
-# db_path (NULL = in-memory) sets the SQLite checkpoint path the server
-# should use when this graph runs.
+#' Attach durable memory to a graph
+#'
+#' Configures the SQLite checkpoint database used to persist this graph's
+#' thread memory across server restarts.
+#'
+#' @param builder A graph builder from [lg_graph()].
+#' @param db_path Path to the SQLite database file. `NULL` keeps in-memory
+#'   memory (lost when the server stops).
+#' @return The builder, invisibly, for piping with `|>`.
+#' @export
 lg_set_memory <- function(builder, db_path = NULL) {
   # Store the database path on the builder (used by the compiler).
   builder$memory <- list(db_path = db_path)
@@ -91,13 +134,30 @@ lg_set_memory <- function(builder, db_path = NULL) {
   invisible(builder)
 }
 
-# lg_compile finalises the builder and registers the graph on the server.
+#' Compile a graph and register it on the hidden server
+#'
+#' Validates the builder, registers the graph spec with the hidden LangGraph
+#' server, and returns a ready-to-run [LgGraph] object. The R node functions
+#' never leave your machine: the server pauses at each node and R executes
+#' them locally.
+#'
+#' @param builder A graph builder from [lg_graph()].
+#' @return An [LgGraph] object with an `invoke()` method.
+#' @export
 lg_compile <- function(builder) {
   # Delegate all real work to the compiler (kept in compiler.R).
   .lg_compile_graph(builder)
 }
 
-# print method: make a builder print nicely in the console.
+#' Print a graph builder
+#'
+#' Console output for graph builder objects; called automatically.
+#'
+#' @param x A graph builder from [lg_graph()].
+#' @param ... Unused.
+#' @return The builder, invisibly.
+#' @export
+#' @exportS3Method print lg_graph_builder
 print.lg_graph_builder <- function(x, ...) {
   # Report the graph id and how many nodes/edges it currently has.
   cat("<lg_graph_builder> id:", x$id,

@@ -25,13 +25,13 @@ jobs:
           python-version: '3.12'
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          extra-packages: any::testthat, local::.
+          extra-packages: any::testthat, local::LanggraphR
       - name: Install Python server dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r langgraphr/inst/server/requirements.txt
+          pip install -r LanggraphR/inst/server/requirements.txt
       - name: Run tests
         env:
           _R_CHECK_FORCE_SUGGESTS_: false
-        run: testthat::test_local("langgraphr")
+        run: testthat::test_local("LanggraphR")
         shell: Rscript {0}

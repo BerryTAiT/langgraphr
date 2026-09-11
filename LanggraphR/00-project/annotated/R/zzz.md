@@ -37,5 +37,7 @@
   # lg_stop_server() is defined in server.R; calling it here kills the
   # background server process if one is running, then clears the handle.
   lg_stop_server()
+  # Also stop the optional local relay (relay.R) if it was started.
+  .lg_stop_relay()
 }
 ```
