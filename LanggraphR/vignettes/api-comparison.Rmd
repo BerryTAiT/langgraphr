@@ -1,0 +1,421 @@
+---
+title: "API Comparison"
+description: "Feature-by-feature comparison of langgraphr versus Python LangGraph."
+vignette: >
+  %\VignetteIndexEntry{API Comparison}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# API Comparison
+
+langgraphr wraps LangGraph, but not every Python feature has an R-facing API. This guide maps Python LangGraph to langgraphr so you know exactly what is available, what is possible with R code, and what is on the roadmap.
+
+---
+
+## Quick Reference
+
+| LangGraph (Python) | langgraphr (R) | Status |
+|---|---|---|
+| `StateGraph` | `lg_graph()` | Available |
+| `add_node()` | `lg_add_node()` | Available |
+| `add_edge()` | `lg_add_edge()` | Available |
+| `add_conditional_edges()` | Node returns `goto` | Available |
+| `compile()` | `lg_compile()` | Available |
+| `invoke()` | `graph$invoke()` | Available |
+| `create_react_agent()` | `lg_connect()` | Available |
+| `ToolNode` | `agent$add_tool()` | Available |
+| `interrupt()` | Automatic (built-in) | Available |
+| `Command(resume=)` | Automatic (built-in) | Available |
+| `InMemorySaver` | Default behavior | Available |
+| `SqliteSaver` | `lg_use_sqlite()` | Available |
+| `ChatOpenAI` | `lg_call_model()` | Available |
+| `Send` (parallel fan-out) | — | Roadmap |
+| `stream()` | — | Roadmap |
+| `get_state()` | — | Not available |
+| `get_state_history()` | — | Not available |
+| `update_state()` | — | Not available |
+| `PostgresSaver` | — | Not available |
+| `BaseStore` (long-term) | — | Not available |
+| `@entrypoint` / `@task` | — | Not available |
+| Breakpoints | — | Not available |
+| Time travel (replay/fork) | — | Not available |
+
+---
+
+## Graph Construction
+
+### Python LangGraph
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+graph = StateGraph(dict)
+graph.add_node("step_1", step_1_fn)
+graph.add_node("step_2", step_2_fn)
+graph.add_edge(START, "step_1")
+graph.add_edge("step_1", "step_2")
+graph.add_edge("step_2", END)
+graph.add_conditional_edges("step_1", router_fn, {"a": "node_a", "b": "node_b"})
+compiled = graph.compile(checkpointer=SqliteSaver(...))
+```
+
+### langgraphr
+
+```r
+graph <- lg_graph("my_graph",
+  state = list(value = list(type = "number", reducer = "overwrite")))
+
+graph <- graph |>
+  lg_add_node("step_1", step_1_fn) |>
+  lg_add_node("step_2", step_2_fn) |>
+  lg_add_edge("step_1", "step_2")
+
+# Conditional routing is done INSIDE the node function
+step_1_fn <- function(state) {
+  list(
+    updates = list(value = 42),
+    goto = if (state$value > 10) "step_2" else "step_1"
+  )
+}
+
+compiled <- lg_compile(graph)
+```
+
+**Key difference:** In Python, conditional edges are declared in the graph definition. In langgraphr, routing is dynamic — the node function decides the next node by returning `goto`.
+
+---
+
+## State Management
+
+### Python LangGraph
+
+```python
+from typing import Annotated, TypedDict
+from operator import add
+
+class State(TypedDict):
+    count: int
+    messages: Annotated[list, add]  # custom reducer
+```
+
+### langgraphr
+
+```r
+g <- lg_graph("demo",
+  state = list(
+    count = list(type = "number", reducer = "overwrite"),
+    messages = list(type = "list", reducer = "append")
+  ))
+```
+
+| Feature | Python | R |
+|---|---|---|
+| TypedDict schema | `TypedDict` | `list(type = "...", reducer = "...")` |
+| Custom reducer | `Annotated[type, fn]` | Not available (overwrite or append only) |
+| Private state | Separate schema | Not available |
+| Input schema | `input_schema` | Implicit (always `str`) |
+| Output schema | `output_schema` | Not available |
+
+---
+
+## Reducers
+
+| Python | R | Description |
+|---|---|---|
+| No annotation (default) | `reducer = "overwrite"` | New value replaces old |
+| `Annotated[list, add]` | `reducer = "append"` | Append to list |
+| `Annotated[list, custom_fn]` | Not available | Custom merge logic |
+| `Overwrite` | `reducer = "overwrite"` | Force overwrite even on lists |
+
+**Workaround for custom reducers:** Implement the merge logic inside your node functions:
+
+```r
+# Instead of a custom "merge" reducer, do the merge in the node
+my_node <- function(state) {
+  current <- state$data %||% list()
+  new_items <- compute_new_items()
+  merged <- merge_function(current, new_items)  # your custom logic
+
+  list(updates = list(data = merged))  # overwrite with merged result
+}
+```
+
+---
+
+## Prebuilt Agents
+
+### create_react_agent
+
+**Python:**
+```python
+from langgraph.prebuilt import create_react_agent
+agent = create_react_agent(model, tools, state_schema=MyState)
+```
+
+**R:**
+```r
+agent <- lg_connect()
+agent$add_tool(my_function, description = "...")
+result <- agent$invoke("Hello")
+```
+
+### ToolNode
+
+**Python:**
+```python
+from langgraph.prebuilt import ToolNode
+tool_node = ToolNode([my_tool, other_tool])
+```
+
+**R:** Tools are registered directly on the agent — there is no separate `ToolNode` class. The tool loop is built into the assistant graph.
+
+### ValidationNode
+
+**Python:** `ValidationNode` validates tool call arguments before execution.
+
+**R:** Not available. Validation must be done inside your tool functions:
+
+```r
+my_tool <- function(data, n) {
+  if (!is.numeric(n) || n < 1) stop("n must be a positive number")
+  # ... proceed
+}
+```
+
+---
+
+## Human-in-the-Loop
+
+### Interrupt and Resume
+
+**Python:**
+```python
+from langgraph.types import interrupt, Command
+
+def my_node(state):
+    user_input = interrupt("What do you think?")  # pauses graph
+    return {"answer": user_input}
+
+# Resume:
+graph.invoke(Command(resume="user response"), config)
+```
+
+**R:** The interrupt-resume pattern is the **core mechanism** of langgraphr — every tool call and every node execution uses it. But it is automatic: you do not call `interrupt()` yourself. The hidden Python server calls it when it needs R to execute a function.
+
+| Python | R |
+|---|---|
+| Explicit `interrupt()` in node code | Automatic (built into the bridge) |
+| `Command(resume=value)` | Automatic (R sends results back) |
+| `interrupt()` for human approval | Not directly available |
+| Breakpoints (`stop_at`) | Not available |
+
+**Workaround for human approval:** Use a graph node that calls `readline()`:
+
+```r
+approval_node <- function(state) {
+  cat("Proposed action:", state$proposal, "\n")
+  answer <- readline("Approve? (yes/no): ")
+  if (tolower(answer) == "yes") {
+    list(updates = list(approved = TRUE), goto = "execute")
+  } else {
+    list(updates = list(approved = FALSE), goto = "revise")
+  }
+}
+```
+
+---
+
+## Streaming
+
+**Python:** `graph.stream()` with modes: `values`, `updates`, `debug`, `custom`, token streaming.
+
+**R:** Not yet available. `invoke()` returns the complete result in one call. Token streaming is on the roadmap.
+
+**Current workaround:** Use Shiny reactive polling for UI updates:
+
+```r
+# In a Shiny app, poll for results
+result <- agent$invoke(question)
+# Result arrives all at once — no token-by-token streaming
+```
+
+---
+
+## Memory & Persistence
+
+| Feature | Python | R |
+|---|---|---|
+| In-memory | `InMemorySaver()` | Default (no config needed) |
+| SQLite | `SqliteSaver()` | `lg_use_sqlite("path.sqlite")` |
+| Postgres | `PostgresSaver()` | Not available |
+| Store (cross-thread) | `InMemoryStore`, `BaseStore` | Not available |
+| State history | `get_state_history()` | Not available |
+| Update state | `update_state()` | Not available |
+| Thread listing | `graph.get_state()` | `lg_threads()` |
+
+---
+
+## Multi-Agent
+
+| Pattern | Python | R |
+|---|---|---|
+| Supervisor | `langgraph-supervisor` package | Build with `lg_graph()` — see [Multi-Agent Systems](multi-agent-systems.html) |
+| Swarm | `langgraph-swarm` package | Build with `lg_graph()` — see swarm pattern |
+| Hierarchical | Custom graph | Build with nested `lg_graph()` — see hierarchical pattern |
+
+All multi-agent patterns are **implementable in R** using the graph authoring API. They are not pre-built, but the [Multi-Agent Systems guide](multi-agent-systems.html) provides complete implementations.
+
+---
+
+## Parallel Execution
+
+**Python:**
+```python
+from langgraph.types import Send
+graph.add_edge("node_a", ["node_b", "node_c"])  # fan-out
+```
+
+**R:** Not yet available. Parallel `Send` is on the roadmap. Currently, graphs execute single-path — one node at a time.
+
+**Workaround:** Simulate parallelism by executing subtasks sequentially within a node:
+
+```r
+parallel_node <- function(state) {
+  # Run "parallel" tasks sequentially
+  result_a <- lg_call_model(list(...))  # task A
+  result_b <- lg_call_model(list(...))  # task B
+  result_c <- lg_call_model(list(...))  # task C
+
+  list(updates = list(
+    task_a = result_a,
+    task_b = result_b,
+    task_c = result_c
+  ), goto = "aggregate")
+}
+```
+
+---
+
+## Subgraphs
+
+**Python:** Compile a subgraph and add it as a node in a parent graph.
+
+**R:** Not available as a native feature. Workaround: call a compiled graph from within a node function:
+
+```r
+# Compile a "subgraph"
+subgraph <- lg_graph("sub", state = list(...)) |>
+  lg_add_node("step", step_fn) |>
+  lg_compile()
+
+# Use it inside a parent graph node
+parent_node <- function(state) {
+  # Run the subgraph
+  sub_result <- subgraph$invoke(state$input)
+
+  # Use its result
+  list(updates = list(sub_output = sub_result$state), goto = "next")
+}
+```
+
+---
+
+## Error Handling
+
+**Python:** Retry policies, node timeouts, `NodeError`, error routing with `Command`.
+
+**R:** Error handling is simpler:
+- Tool function errors are caught and sent back to the LLM as tool results
+- Node function errors stop the graph run
+- No retry policy configuration
+- No per-node timeouts
+
+**Workaround for retry logic:**
+
+```r
+retry_node <- function(state) {
+  max_attempts <- 3
+  for (i in seq_len(max_attempts)) {
+    result <- tryCatch({
+      # Your logic here
+      lg_call_model(list(...))
+    }, error = function(e) {
+      if (i == max_attempts) stop(e)
+      NULL
+    })
+    if (!is.null(result)) break
+  }
+  list(updates = list(result = result), goto = "next")
+}
+```
+
+---
+
+## Functional API
+
+**Python:** `@entrypoint` and `@task` decorators for a functional alternative to StateGraph.
+
+**R:** Not available. langgraphr only supports the graph API. All logic is expressed as node functions in a `lg_graph()` graph.
+
+---
+
+## Observability
+
+**Python:** LangSmith tracing, `tracing_context`, tags, metadata.
+
+**R:** Not available. Debugging is done via:
+- `options(langgraphr.debug = TRUE)` — prints server logs
+- `lg_start_server(logfile = "debug.log")` — writes logs to a file
+- R-level debugging in node functions (using `cat()` or `print()`)
+
+---
+
+## Deployment
+
+**Python:** LangGraph Platform, LangSmith Cloud, `langgraph.json` config, Docker.
+
+**R:** No deployment platform. langgraphr runs locally. For sharing:
+- Deploy the R script on a server with R + Python installed
+- Use Shiny Server or Shinyapps for Shiny-based agents
+- The Python server starts automatically when the R script runs
+
+---
+
+## Feature Gap Summary
+
+### Available now
+
+- Graph construction (nodes, edges, conditional routing)
+- State channels with overwrite/append reducers
+- Assistant agent with tool calling (ReAct)
+- Thread-based memory (in-memory + SQLite)
+- Direct model calls
+- Tool schema inference
+- Network resilience (proxy auto-detection, relay fallback)
+- All design patterns (chaining, routing, orchestrator-worker, reflection, plan-and-execute)
+- All multi-agent patterns (supervisor, network, hierarchical, swarm)
+- All RAG patterns (basic, adaptive, corrective, self-RAG)
+
+### On the roadmap
+
+- Parallel `Send` (fan-out/fan-in)
+- Token streaming (SSE)
+- PostgresSaver
+- Long-term Store
+- Breakpoints
+
+### Not planned (out of scope)
+
+- Functional API (`@entrypoint`, `@task`)
+- LangSmith integration
+- LangGraph Platform deployment
+- `langgraph.json` config
+
+---
+
+## See Also
+
+- [Architecture](architecture.html) — how the interrupt bridge works
+- [Design Patterns](design-patterns.html) — patterns you can build today
+- [FAQ](faq.html) — common questions

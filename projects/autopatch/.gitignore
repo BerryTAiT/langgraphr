@@ -1,0 +1,4 @@
+autopatch.db
+autopatch.db-journal
+patches/
+run_info.json

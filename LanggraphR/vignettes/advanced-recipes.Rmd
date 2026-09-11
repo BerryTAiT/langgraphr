@@ -1,0 +1,1009 @@
+---
+title: "Advanced Recipes"
+description: "Complete AI applications built with langgraphr — chatbots, data analysts, code assistants, content generators, and more."
+vignette: >
+  %\VignetteIndexEntry{Advanced Recipes}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Advanced Recipes
+
+Complete, production-oriented AI applications built with langgraphr. Each recipe is a self-contained system you can adapt to your own use case.
+
+---
+
+## Recipe 1: Memory-Aware Chatbot
+
+A chatbot that remembers conversation history, summarizes old messages when the context gets too long, and maintains a user profile.
+
+```r
+library(langgraphr)
+
+chatbot_graph <- lg_graph("smart_chatbot",
+  state = list(
+    messages = list(type = "list", reducer = "append"),
+    summary = list(type = "str", reducer = "overwrite"),
+    user_profile = list(type = "str", reducer = "overwrite"),
+    char_count = list(type = "number", reducer = "overwrite"),
+    response = list(type = "str", reducer = "overwrite")
+  ))
+
+# Node 1: Check if we need to summarize
+manage_memory_node <- function(state) {
+  messages <- state$messages %||% list()
+  total_chars <- sum(sapply(messages, function(m) nchar(m$content %||% "")))
+
+  # If conversation is long, summarize old messages
+  if (total_chars > 2000) {
+    old_msgs <- messages[1:max(1, length(messages) - 4)]
+
+    summary <- lg_call_model(list(
+      list(role = "system", content = paste(
+        "Summarize the conversation so far. Capture key facts about the user.",
+        "Be concise. Include the user's name, preferences, and key topics discussed."
+      )),
+      list(role = "user", content = paste(sapply(old_msgs, function(m) {
+        paste0(m$role, ": ", m$content)
+      }), collapse = "\n"))
+    ))
+
+    # Keep only the last 4 messages plus the summary
+    list(
+      updates = list(
+        summary = summary,
+        messages = messages[(length(messages) - 3):length(messages)],
+        char_count = total_chars
+      ),
+      goto = "update_profile"
+    )
+  } else {
+    list(
+      updates = list(char_count = total_chars),
+      goto = "update_profile"
+    )
+  }
+}
+
+# Node 2: Extract user profile information
+profile_node <- function(state) {
+  last_user_msg <- NULL
+  msgs <- state$messages
+  for (i in seq(length(msgs), 1, by = -1)) {
+    if (msgs[[i]]$role == "user") {
+      last_user_msg <- msgs[[i]]$content
+      break
+    }
+  }
+
+  if (is.null(last_user_msg)) {
+    return(list(goto = "respond"))
+  }
+
+  # Ask the LLM to extract user profile info
+  profile_update <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Extract any new information about the user (name, preferences, goals, etc.).",
+      "If no new info, respond with 'NONE'.",
+      "Current profile:", state$user_profile %||% "No profile yet."
+    )),
+    list(role = "user", content = last_user_msg)
+  ), temperature = 0, max_tokens = 100)
+
+  if (!grepl("NONE", profile_update, ignore.case = TRUE)) {
+    current <- state$user_profile %||% ""
+    new_profile <- if (nchar(current) > 0) {
+      paste(current, profile_update, sep = "\n")
+    } else {
+      profile_update
+    }
+    list(updates = list(user_profile = new_profile), goto = "respond")
+  } else {
+    list(goto = "respond")
+  }
+}
+
+# Node 3: Generate response with full context
+respond_node <- function(state) {
+  # Build the system prompt with summary and profile
+  sys_parts <- c("You are a helpful, friendly assistant.")
+
+  if (!is.null(state$summary) && nchar(state$summary) > 0) {
+    sys_parts <- c(sys_parts, paste("Previous conversation summary:", state$summary))
+  }
+
+  if (!is.null(state$user_profile) && nchar(state$user_profile) > 0) {
+    sys_parts <- c(sys_parts, paste("User profile:", state$user_profile))
+  }
+
+  sys_prompt <- paste(sys_parts, collapse = "\n\n")
+
+  # Build message list
+  messages <- c(list(list(role = "system", content = sys_prompt)), state$messages)
+
+  response <- lg_call_model(messages)
+
+  list(
+    updates = list(
+      response = response,
+      messages = list(role = "assistant", content = response)
+    )
+  )
+}
+
+chatbot <- chatbot_graph |>
+  lg_add_node("manage_memory", manage_memory_node) |>
+  lg_add_node("update_profile", profile_node) |>
+  lg_add_node("respond", respond_node) |>
+  lg_add_edge("manage_memory", "update_profile") |>
+  lg_add_edge("update_profile", "respond") |>
+  lg_compile()
+
+# Usage in a loop
+# graph$invoke("Hi, I'm Sarah and I'm learning R")
+# graph$invoke("What data visualization packages do you recommend?")
+# graph$invoke("What is my name?")  # The bot remembers
+```
+
+---
+
+## Recipe 2: Data Analysis Agent
+
+An agent that can load data, explore it, generate visualizations, and answer questions about the data.
+
+```r
+library(langgraphr)
+
+agent <- lg_connect()
+
+# Tool: Load and describe a CSV file
+load_data <- function(filepath) {
+  df <- read.csv(filepath)
+  list(
+    file = filepath,
+    rows = nrow(df),
+    cols = ncol(df),
+    columns = names(df),
+    head = head(df, 3),
+    summary = summary(df)
+  )
+}
+agent$add_tool(load_data,
+  description = "Load a CSV file and return its structure, dimensions, and summary stats")
+
+# Tool: Compute statistics
+compute_stats <- function(data, column, stat = "all") {
+  vals <- data[[column]]
+  if (!is.numeric(vals)) {
+    return(paste("Column", column, "is not numeric. Unique values:", paste(unique(vals), collapse = ", ")))
+  }
+
+  switch(stat,
+    "mean"   = mean(vals, na.rm = TRUE),
+    "median" = median(vals, na.rm = TRUE),
+    "sd"     = sd(vals, na.rm = TRUE),
+    "min"    = min(vals, na.rm = TRUE),
+    "max"    = max(vals, na.rm = TRUE),
+    "all"    = list(mean = mean(vals, na.rm = TRUE),
+                    median = median(vals, na.rm = TRUE),
+                    sd = sd(vals, na.rm = TRUE),
+                    min = min(vals, na.rm = TRUE),
+                    max = max(vals, na.rm = TRUE),
+                    n_missing = sum(is.na(vals)))
+  )
+}
+agent$add_tool(compute_stats,
+  description = "Compute statistics for a column in a data frame. Options: mean, median, sd, min, max, all",
+  parameters = list(
+    type = "object",
+    properties = list(
+      data = list(type = "string", description = "JSON string of the data frame"),
+      column = list(type = "string", description = "The column name to analyze"),
+      stat = list(type = "string", description = "Which statistic to compute (default: all)")
+    ),
+    required = c("data", "column")
+  ))
+
+# Tool: Filter data
+filter_data <- function(data, column, value) {
+  data[data[[column]] == value, ]
+}
+agent$add_tool(filter_data,
+  description = "Filter a data frame to rows where a column equals a value")
+
+# Tool: Create a plot
+create_plot <- function(data, x_col, y_col = NULL, plot_type = "scatter") {
+  tmp <- tempfile(fileext = ".png")
+  png(tmp, width = 800, height = 500)
+
+  if (plot_type == "histogram") {
+    hist(data[[x_col]], main = paste("Histogram of", x_col),
+         xlab = x_col, col = "#5b5bd6", border = "white")
+  } else if (plot_type == "bar") {
+    barplot(table(data[[x_col]]), main = paste("Bar chart of", x_col),
+            col = "#5b5bd6", border = "white")
+  } else if (!is.null(y_col)) {
+    plot(data[[x_col]], data[[y_col]], main = paste(y_col, "vs", x_col),
+         xlab = x_col, ylab = y_col, pch = 19, col = "#5b5bd6")
+  } else {
+    plot(data[[x_col]], main = paste(x_col, "over rows"),
+         ylab = x_col, type = "l", col = "#5b5bd6")
+  }
+
+  dev.off()
+  paste("Plot saved to:", tmp)
+}
+agent$add_tool(create_plot,
+  description = "Create a plot from data. Types: scatter, histogram, bar. For scatter, provide x_col and y_col.",
+  parameters = list(
+    type = "object",
+    properties = list(
+      data = list(type = "string", description = "JSON string of the data frame"),
+      x_col = list(type = "string", description = "Column for x-axis"),
+      y_col = list(type = "string", description = "Column for y-axis (optional)"),
+      plot_type = list(type = "string", description = "scatter, histogram, or bar (default: scatter)")
+    ),
+    required = c("data", "x_col")
+  ))
+
+# Tool: Correlation analysis
+correlations <- function(data) {
+  nums <- data[sapply(data, is.numeric)]
+  if (ncol(nums) < 2) return("Not enough numeric columns for correlation analysis.")
+
+  cor_matrix <- cor(nums, use = "complete.obs")
+  # Find strongest correlations
+  cor_vals <- as.vector(cor_matrix[lower.tri(cor_matrix)])
+  cor_order <- order(abs(cor_vals), decreasing = TRUE)
+
+  pairs <- which(lower.tri(cor_matrix), arr.ind = TRUE)
+  pairs <- pairs[cor_order, ]
+
+  top_pairs <- lapply(head(cor_order, 3), function(i) {
+    list(
+      col1 = names(nums)[pairs[i, 1]],
+      col2 = names(nums)[pairs[i, 2]],
+      correlation = round(cor_vals[i], 3)
+    )
+  })
+
+  top_pairs
+}
+agent$add_tool(correlations,
+  description = "Find the strongest correlations between numeric columns in a data frame")
+
+# Example usage
+sales_data <- data.frame(
+  product = c("A", "B", "C", "D", "E"),
+  revenue = c(120, 340, 95, 210, 175),
+  units = c(12, 45, 8, 28, 21),
+  rating = c(4.2, 4.5, 3.1, 4.0, 3.8)
+)
+
+result <- agent$invoke(paste0(
+  "Here is sales data: ", jsonlite::toJSON(sales_data, auto_unbox = TRUE),
+  ". Analyze the data: compute summary stats for revenue,",
+  " find correlations, and tell me which product has the highest revenue."
+))
+cat(result$content)
+```
+
+---
+
+## Recipe 3: Code Assistant
+
+An agent that can write, review, test, and explain R code.
+
+```r
+library(langgraphr)
+
+agent <- lg_connect()
+
+# Tool: Execute R code and return output
+run_code <- function(code) {
+  # Capture output safely
+  result <- tryCatch({
+    output <- capture.output(eval(parse(text = code)))
+    paste(output, collapse = "\n")
+  }, error = function(e) {
+    paste("Error:", e$message)
+  }, warning = function(w) {
+    paste("Warning:", conditionMessage(w))
+  })
+
+  result
+}
+agent$add_tool(run_code,
+  description = "Execute R code and return the output. Use this to test code.",
+  parameters = list(
+    type = "object",
+    properties = list(
+      code = list(type = "string", description = "The R code to execute")
+    ),
+    required = c("code")
+  ))
+
+# Tool: Check if a package is installed
+check_package <- function(package_name) {
+  installed <- requireNamespace(package_name, quietly = TRUE)
+  if (installed) {
+    version <- as.character(packageVersion(package_name))
+    paste(package_name, "is installed, version:", version)
+  } else {
+    paste(package_name, "is NOT installed. Install with: install.packages('", package_name, "')", sep = "")
+  }
+}
+agent$add_tool(check_package,
+  description = "Check if an R package is installed and get its version")
+
+# Tool: Get function documentation
+get_help <- function(function_name) {
+  help_text <- tryCatch({
+    rd <- utils:::.getHelpFile(utils::help(function_name))
+    paste(sapply(rd, function(x) {
+      if (is.character(x)) paste(x, collapse = " ")
+      else ""
+    }), collapse = "\n")
+  }, error = function(e) {
+    paste("No documentation found for:", function_name)
+  })
+
+  substr(help_text, 1, 500)
+}
+agent$add_tool(get_help,
+  description = "Get R function documentation and help text")
+
+# Tool: Format code
+format_code <- function(code) {
+  # Simple formatting: consistent indentation
+  lines <- strsplit(code, "\n")[[1]]
+  indent <- 0
+  formatted <- sapply(lines, function(line) {
+    trimmed <- trimws(line)
+    if (grepl("[}]\\s*$", trimmed)) indent <<- max(0, indent - 1)
+    result <- paste0(paste(rep("  ", indent), collapse = ""), trimmed)
+    if (grepl("[{]\\s*$", trimmed)) indent <<- indent + 1
+    result
+  })
+  paste(formatted, collapse = "\n")
+}
+agent$add_tool(format_code,
+  description = "Format R code with consistent indentation")
+
+# Usage
+result <- agent$invoke(paste(
+  "Write an R function that takes a data frame and a column name,",
+  "and returns a boxplot of that column. Test the code with the",
+  "built-in mtcars dataset and mpg column."
+))
+cat(result$content)
+```
+
+---
+
+## Recipe 4: Content Generation Pipeline
+
+A multi-stage content generation system: research → outline → draft → edit → format.
+
+```r
+library(langgraphr)
+
+content_pipeline <- lg_graph("content_pipeline",
+  state = list(
+    topic = list(type = "str", reducer = "overwrite"),
+    research = list(type = "str", reducer = "overwrite"),
+    outline = list(type = "list", reducer = "overwrite"),
+    draft = list(type = "str", reducer = "overwrite"),
+    edited = list(type = "str", reducer = "overwrite"),
+    formatted = list(type = "str", reducer = "overwrite"),
+    word_count = list(type = "number", reducer = "overwrite")
+  ))
+
+# Stage 1: Research
+research_node <- function(state) {
+  research <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a researcher. Gather key facts, statistics, and insights about the topic.",
+      "Be comprehensive but factual. Include data points where possible."
+    )),
+    list(role = "user", content = state$input)
+  ))
+  list(updates = list(topic = state$input, research = research), goto = "outline")
+}
+
+# Stage 2: Create outline
+outline_node <- function(state) {
+  outline_text <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Create a detailed outline for an article based on the research.",
+      "Format as: SECTION: Title | Description",
+      "Include 4-6 sections."
+    )),
+    list(role = "user", content = paste0("Topic: ", state$topic, "\n\nResearch:\n", state$research))
+  ))
+
+  # Parse outline into structured list
+  sections <- strsplit(outline_text, "\n")[[1]]
+  sections <- trimws(sections)
+  sections <- sections[nchar(sections) > 0]
+  sections <- sub("^SECTION:\\s*", "", sections)
+
+  list(updates = list(outline = sections), goto = "draft")
+}
+
+# Stage 3: Write draft
+draft_node <- function(state) {
+  draft <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Write a full article based on this outline and research.",
+      "Target 500-800 words. Include an introduction and conclusion.",
+      "Use the research for factual content and citations."
+    )),
+    list(role = "user", content = paste0(
+      "Topic: ", state$topic,
+      "\n\nResearch:\n", state$research,
+      "\n\nOutline:\n", paste(state$outline, collapse = "\n")
+    ))
+  ), max_tokens = 1000)
+
+  words <- length(strsplit(draft, "\\s+")[[1]])
+
+  list(updates = list(draft = draft, word_count = words), goto = "edit")
+}
+
+# Stage 4: Edit
+edit_node <- function(state) {
+  edited <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Edit this article for:",
+      "1. Clarity and readability",
+      "2. Grammar and spelling",
+      "3. Flow between paragraphs",
+      "4. Strong opening and closing",
+      "5. Remove redundancy",
+      "Return only the edited article."
+    )),
+    list(role = "user", content = state$draft
+  )), max_tokens = 1000)
+
+  list(updates = list(edited = edited), goto = "format")
+}
+
+# Stage 5: Format
+format_node <- function(state) {
+  formatted <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Format this article for publication:",
+      "- Add a compelling title",
+      "- Use markdown headings (##)",
+      "- Add bullet points where appropriate",
+      "- Bold key terms",
+      "Return only the formatted article."
+    )),
+    list(role = "user", content = state$edited
+  )), max_tokens = 1000)
+
+  words <- length(strsplit(formatted, "\\s+")[[1]])
+
+  list(updates = list(formatted = formatted, word_count = words))
+}
+
+pipeline <- content_pipeline |>
+  lg_add_node("research", research_node) |>
+  lg_add_node("outline", outline_node) |>
+  lg_add_node("draft", draft_node) |>
+  lg_add_node("edit", edit_node) |>
+  lg_add_node("format", format_node) |>
+  lg_add_edge("research", "outline") |>
+  lg_add_edge("outline", "draft") |>
+  lg_add_edge("draft", "edit") |>
+  lg_add_edge("edit", "format") |>
+  lg_compile()
+
+result <- pipeline$invoke("The rise of R as a data science language")
+cat(result$state$formatted)
+cat("\n\nWord count:", result$state$word_count)
+```
+
+---
+
+## Recipe 5: SQL Query Agent
+
+An agent that translates natural language to SQL, executes it, and explains the results.
+
+```r
+library(langgraphr)
+
+sql_agent <- lg_connect()
+
+# Tool: Get database schema
+get_schema <- function(table_name = NULL) {
+  # In production, query the actual database
+  schema <- list(
+    customers = list(
+      columns = list(
+        id = "INTEGER PRIMARY KEY",
+        name = "TEXT",
+        email = "TEXT",
+        signup_date = "DATE",
+        tier = "TEXT (free, pro, enterprise)"
+      )
+    ),
+    orders = list(
+      columns = list(
+        id = "INTEGER PRIMARY KEY",
+        customer_id = "INTEGER (FK to customers.id)",
+        product = "TEXT",
+        amount = "REAL",
+        order_date = "DATE",
+        status = "TEXT (pending, shipped, delivered)"
+      )
+    )
+  )
+
+  if (!is.null(table_name) && table_name %in% names(schema)) {
+    return(schema[[table_name]])
+  }
+  schema
+}
+sql_agent$add_tool(get_schema,
+  description = "Get the database schema. Optionally specify a table name for details on one table.")
+
+# Tool: Execute SQL query (mocked for safety)
+run_query <- function(sql, max_rows = 100) {
+  # In production, connect to a real database
+  # For this example, return mock data
+  if (grepl("SELECT.*FROM customers", sql, ignore.case = TRUE)) {
+    data.frame(
+      id = 1:3,
+      name = c("Alice", "Bob", "Carol"),
+      email = c("alice@example.com", "bob@example.com", "carol@example.com"),
+      tier = c("pro", "free", "enterprise")
+    )
+  } else if (grepl("SELECT.*FROM orders", sql, ignore.case = TRUE)) {
+    data.frame(
+      id = 1:5,
+      customer_id = c(1, 2, 1, 3, 2),
+      product = c("Widget A", "Widget B", "Widget C", "Widget A", "Widget B"),
+      amount = c(29.99, 49.99, 19.99, 29.99, 49.99),
+      status = c("delivered", "shipped", "pending", "delivered", "delivered")
+    )
+  } else {
+    data.frame(result = "Query executed. No matching mock data.")
+  }
+}
+sql_agent$add_tool(run_query,
+  description = "Execute a SQL SELECT query and return results as a data frame. Only SELECT queries allowed.",
+  parameters = list(
+    type = "object",
+    properties = list(
+      sql = list(type = "string", description = "A valid SQL SELECT query"),
+      max_rows = list(type = "number", description = "Maximum rows to return (default 100)")
+    ),
+    required = c("sql")
+  ))
+
+# Tool: Explain query results
+explain_results <- function(data, question) {
+  explanation <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Analyze the query results and explain what they mean",
+      "in relation to the user's question. Be concise."
+    )),
+    list(role = "user", content = paste0(
+      "Question: ", question,
+      "\n\nResults:\n", jsonlite::toJSON(data, auto_unbox = TRUE, pretty = TRUE)
+    ))
+  ))
+  explanation
+}
+sql_agent$add_tool(explain_results,
+  description = "Explain query results in plain language. Provide the data and the original question.",
+  parameters = list(
+    type = "object",
+    properties = list(
+      data = list(type = "string", description = "JSON string of the query results"),
+      question = list(type = "string", description = "The original user question")
+    ),
+    required = c("data", "question")
+  ))
+
+result <- sql_agent$invoke("What is the total revenue from each product?")
+cat(result$content)
+```
+
+---
+
+## Recipe 6: Document Summarizer with Hierarchy
+
+Summarize long documents at multiple levels of detail: executive summary, section summaries, and key points.
+
+```r
+library(langgraphr)
+
+summarizer <- lg_graph("hierarchical_summary",
+  state = list(
+    document = list(type = "str", reducer = "overwrite"),
+    chunks = list(type = "list", reducer = "overwrite"),
+    chunk_summaries = list(type = "list", reducer = "append"),
+    section_summary = list(type = "str", reducer = "overwrite"),
+    executive_summary = list(type = "str", reducer = "overwrite"),
+    key_points = list(type = "list", reducer = "overwrite"),
+    current_chunk = list(type = "number", reducer = "overwrite")
+  ))
+
+# Step 1: Chunk the document
+chunk_node <- function(state) {
+  text <- state$input
+  # Split by paragraphs or every 1000 characters
+  paragraphs <- strsplit(text, "\n\n")[[1]]
+  if (length(paragraphs) <= 1) {
+    # Split by length
+    paragraphs <- chunk_text(text, chunk_size = 1000, overlap = 50)
+  }
+
+  # Merge short paragraphs
+  chunks <- c()
+  current <- ""
+  for (p in paragraphs) {
+    if (nchar(current) + nchar(p) > 1000 && nchar(current) > 0) {
+      chunks <- c(chunks, current)
+      current <- p
+    } else {
+      current <- paste(current, p, sep = "\n\n")
+    }
+  }
+  if (nchar(current) > 0) chunks <- c(chunks, current)
+
+  list(
+    updates = list(document = text, chunks = chunks, current_chunk = 0),
+    goto = "summarize_chunk"
+  )
+}
+
+# Step 2: Summarize each chunk
+summarize_chunk_node <- function(state) {
+  idx <- (state$current_chunk %||% 0) + 1
+
+  if (idx > length(state$chunks)) {
+    return(list(goto = "create_section_summary"))
+  }
+
+  chunk <- state$chunks[idx]
+  summary <- lg_call_model(list(
+    list(role = "system", content = "Summarize this section of a document in 2-3 sentences. Capture key facts."),
+    list(role = "user", content = chunk)
+  ), max_tokens = 150)
+
+  list(
+    updates = list(
+      chunk_summaries = summary,
+      current_chunk = idx
+    ),
+    goto = "summarize_chunk"  # loop for next chunk
+  )
+}
+
+# Step 3: Combine chunk summaries into a section-level summary
+section_summary_node <- function(state) {
+  combined <- paste(state$chunk_summaries, collapse = "\n\n")
+
+  summary <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Synthesize these section summaries into a coherent overview.",
+      "Capture the main themes and conclusions. 3-5 sentences."
+    )),
+    list(role = "user", content = combined
+  )), max_tokens = 300)
+
+  list(updates = list(section_summary = summary), goto = "executive")
+}
+
+# Step 4: Create executive summary
+executive_node <- function(state) {
+  exec <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Create a 1-2 sentence executive summary of the entire document."
+    )),
+    list(role = "user", content = state$section_summary
+  )), max_tokens = 100)
+
+  list(updates = list(executive_summary = exec), goto = "key_points")
+}
+
+# Step 5: Extract key points
+key_points_node <- function(state) {
+  points <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Extract the 5 most important key points from this summary.",
+      "Format as a numbered list, one point per line."
+    )),
+    list(role = "user", content = state$section_summary
+  )), max_tokens = 200)
+
+  # Parse into a list
+  point_list <- strsplit(points, "\n")[[1]]
+  point_list <- trimws(point_list)
+  point_list <- point_list[nchar(point_list) > 0]
+
+  list(updates = list(key_points = point_list))
+}
+
+summarizer_graph <- summarizer |>
+  lg_add_node("chunk", chunk_node) |>
+  lg_add_node("summarize_chunk", summarize_chunk_node) |>
+  lg_add_node("create_section_summary", section_summary_node) |>
+  lg_add_node("executive", executive_node) |>
+  lg_add_node("key_points", key_points_node) |>
+  lg_add_edge("chunk", "summarize_chunk") |>
+  lg_add_edge("summarize_chunk", "summarize_chunk") |>
+  lg_compile()
+
+# Usage with a long document
+long_doc <- paste(rep(
+  "R is a programming language and free software environment for statistical computing and graphics. It is supported by the R Foundation for Statistical Computing. R is widely used by statisticians and data miners for data analysis. ", 20
+), collapse = "\n\n")
+
+result <- summarizer_graph$invoke(long_doc)
+cat("Executive Summary:", result$state$executive_summary, "\n\n")
+cat("Section Summary:", result$state$section_summary, "\n\n")
+cat("Key Points:\n")
+cat(paste(result$state$key_points, collapse = "\n"))
+```
+
+---
+
+## Recipe 7: Shiny Chatbot UI
+
+A minimal Shiny app that wraps an langgraphr agent as an interactive chat.
+
+```r
+library(shiny)
+library(langgraphr)
+
+ui <- fluidPage(
+  titlePanel("R AI Assistant"),
+  sidebarLayout(
+    sidebarPanel(
+      textInput("api_key", "API Key", value = Sys.getenv("LANGGRAPHR_API_KEY")),
+      textInput("model", "Model", value = "deepseek-chat"),
+      actionButton("connect", "Connect"),
+      hr(),
+      actionButton("clear", "Clear Chat"),
+      width = 3
+    ),
+    mainPanel(
+      wellPanel(
+        style = "height: 400px; overflow-y: scroll;",
+        uiOutput("chat_history")
+      ),
+      textInput("user_input", "", placeholder = "Type your message..."),
+      actionButton("send", "Send")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  agent <- reactiveVal(NULL)
+  history <- reactiveVal(list())
+
+  observeEvent(input$connect, {
+    Sys.setenv(
+      LANGGRAPHR_API_KEY = input$api_key,
+      LANGGRAPHR_MODEL = input$model
+    )
+    a <- lg_connect()
+    agent(a)
+    history(c(history(), list(role = "system",
+                               content = "Connected! Ask me anything.")))
+  })
+
+  observeEvent(input$send, {
+    req(agent())
+    msg <- trimws(input$user_input)
+    if (nchar(msg) == 0) return()
+
+    # Add user message
+    history(c(history(), list(role = "user", content = msg)))
+    updateTextInput(session, "user_input", value = "")
+
+    # Get response
+    result <- agent()$invoke(msg)
+    history(c(history(), list(role = "assistant", content = result$content)))
+  })
+
+  observeEvent(input$clear, {
+    req(agent())
+    agent()$reset()
+    history(list())
+  })
+
+  output$chat_history <- renderUI({
+    msgs <- history()
+    html <- lapply(seq_along(msgs), function(i) {
+      msg <- msgs[[i]]
+      if (msg$role == "user") {
+        div(style = "text-align: right; margin: 5px;",
+            span(style = "background: #5b5bd6; color: white; padding: 8px 12px; border-radius: 10px;",
+                 msg$content))
+      } else {
+        div(style = "text-align: left; margin: 5px;",
+            span(style = "background: #e8e8e8; padding: 8px 12px; border-radius: 10px;",
+                 msg$content))
+      }
+    })
+    do.call(tagList, html)
+  })
+}
+
+shinyApp(ui, server)
+```
+
+---
+
+## Recipe 8: Email Assistant
+
+An agent that drafts, reviews, and sends emails based on natural language instructions.
+
+```r
+library(langgraphr)
+
+email_graph <- lg_graph("email_assistant",
+  state = list(
+    instruction = list(type = "str", reducer = "overwrite"),
+    recipient_info = list(type = "str", reducer = "overwrite"),
+    tone = list(type = "str", reducer = "overwrite"),
+    draft = list(type = "str", reducer = "overwrite"),
+    review = list(type = "str", reducer = "overwrite"),
+    score = list(type = "number", reducer = "overwrite"),
+    final_email = list(type = "str", reducer = "overwrite"),
+    subject = list(type = "str", reducer = "overwrite")
+  ))
+
+# Step 1: Analyze the request and set parameters
+analyze_node <- function(state) {
+  analysis <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Analyze the email request and extract:",
+      "1. Recipient info (who, relationship)",
+      "2. Tone (formal, casual, urgent, apologetic, etc.)",
+      "3. Key points to include",
+      "Format: RECIPIENT: ... | TONE: ... | POINTS: ..."
+    )),
+    list(role = "user", content = state$input)
+  ), temperature = 0)
+
+  # Parse
+  tone <- if (grepl("TONE:\\s*(\\w+)", analysis)) {
+    sub(".*TONE:\\s*(\\w+).*", "\\1", analysis)
+  } else "professional"
+
+  list(
+    updates = list(
+      instruction = state$input,
+      recipient_info = analysis,
+      tone = tolower(tone)
+    ),
+    goto = "draft"
+  )
+}
+
+# Step 2: Draft the email
+draft_node <- function(state) {
+  email <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Write an email based on the instruction.",
+      "Tone:", state$tone,
+      "Include a subject line as: SUBJECT: <subject>",
+      "Then write the email body."
+    )),
+    list(role = "user", content = paste(
+      "Instruction:", state$instruction,
+      "\n\nAnalysis:", state$recipient_info
+    ))
+  ), max_tokens = 400)
+
+  # Extract subject
+  subject <- if (grepl("SUBJECT:\\s*(.+)", email)) {
+    sub(".*SUBJECT:\\s*([^\n]+).*", "\\1", email)
+  } else "No subject"
+
+  body <- sub("SUBJECT:[^\\n]*\n?", "", email)
+
+  list(
+    updates = list(draft = body, subject = subject),
+    goto = "review"
+  )
+}
+
+# Step 3: Review and score
+review_node <- function(state) {
+  review <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Review this email for:",
+      "1. Clarity 2. Tone appropriateness 3. Completeness 4. Professionalism",
+      "Give a score 1-10. Format: SCORE: N | FEEDBACK: ..."
+    )),
+    list(role = "user", content = paste0("Subject: ", state$subject, "\n\n", state$draft)
+  )), temperature = 0.2)
+
+  score <- as.numeric(sub(".*SCORE:\\s*(\\d+).*", "\\1", review))
+  if (is.na(score)) score <- 7
+
+  list(
+    updates = list(review = review, score = score),
+    goto = if (score >= 8) "finalize" else "revise"
+  )
+}
+
+# Step 4: Revise if needed
+revise_node <- function(state) {
+  revised <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Revise this email based on the review feedback.",
+      "Address all issues raised. Return only the revised email body."
+    )),
+    list(role = "user", content = paste0(
+      "Original draft:\n", state$draft,
+      "\n\nReview feedback:\n", state$review
+    ))
+  ), max_tokens = 400)
+
+  list(updates = list(draft = revised), goto = "review")
+}
+
+# Step 5: Finalize
+finalize_node <- function(state) {
+  list(updates = list(final_email = state$draft))
+}
+
+email_agent <- email_graph |>
+  lg_add_node("analyze", analyze_node) |>
+  lg_add_node("draft", draft_node) |>
+  lg_add_node("review", review_node) |>
+  lg_add_node("revise", revise_node) |>
+  lg_add_node("finalize", finalize_node) |>
+  lg_add_edge("analyze", "draft") |>
+  lg_add_edge("draft", "review") |>
+  lg_add_edge("review", "revise") |>
+  lg_add_edge("revise", "review") |>
+  lg_compile()
+
+result <- email_agent$invoke(
+  "Write an email to my manager requesting 2 weeks of vacation next month. I have unused PTO."
+)
+cat("Subject:", result$state$subject, "\n\n")
+cat(result$state$final_email)
+cat("\n\nQuality score:", result$state$score)
+```
+
+---
+
+## Helper Function: chunk_text
+
+Several recipes above use this helper — include it in your scripts:
+
+```r
+chunk_text <- function(text, chunk_size = 500, overlap = 50) {
+  n <- nchar(text)
+  if (n <= chunk_size) return(text)
+
+  chunks <- c()
+  start <- 1
+  while (start <= n) {
+    end <- min(start + chunk_size - 1, n)
+    chunks <- c(chunks, substr(text, start, end))
+    start <- end - overlap + 1
+  }
+  chunks
+}
+```
+
+---
+
+## See Also
+
+- [Design Patterns](design-patterns.html) — the building blocks behind these recipes
+- [Multi-Agent Systems](multi-agent-systems.html) — supervisor and hierarchical patterns
+- [RAG Patterns](rag-patterns.html) — retrieval-augmented generation
+- [Extending langgraphr](extending-langgraphr.html) — write your own helper functions

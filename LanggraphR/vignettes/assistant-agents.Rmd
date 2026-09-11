@@ -1,0 +1,299 @@
+---
+title: "Assistant Agents"
+description: "Build LLM-powered assistants whose tools are plain R functions."
+vignette: >
+  %\VignetteIndexEntry{Assistant Agents}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Assistant Agents
+
+The assistant path is the quickest way to build an agentic application. You get a bundled LangGraph agent (LLM + tool loop) out of the box — you only need to register your R functions as tools.
+
+## Creating an Agent
+
+```r
+library(langgraphr)
+
+agent <- lg_connect()
+```
+
+`lg_connect()` starts the hidden server (if not already running) and returns an `LgAgent` R6 object. Each agent has its own thread ID and tool registry.
+
+You can also connect to a specific port or reuse an existing thread:
+
+```r
+# Custom port
+agent <- lg_connect(port = 9000)
+
+# Continue an existing conversation
+agent <- lg_connect(thread_id = "thread_20260906_abc123")
+```
+
+---
+
+## Registering Tools
+
+Tools are plain R functions. The LLM sees their names, descriptions, and argument schemas, and decides when to call them.
+
+### Basic tool registration
+
+```r
+add_numbers <- function(a, b) {
+  a + b
+}
+
+agent$add_tool(add_numbers,
+  description = "Add two numbers and return the sum")
+```
+
+`$add_tool()` automatically:
+
+1. Infers the argument schema from the function's formal arguments
+2. Sends the schema to the server so the model knows about the tool
+3. Stores the R function locally so it can be called when the model requests it
+
+### Tool with default values
+
+Arguments with defaults are optional in the schema. The function signature determines the schema:
+
+```r
+# 'n' has a default, so it is optional in the tool schema
+top_n <- function(data, n = 3) {
+  head(data[order(data$revenue, decreasing = TRUE), ], n)
+}
+
+agent$add_tool(top_n,
+  description = "Return the top-N rows of a data frame by revenue")
+```
+
+### Custom parameter schema
+
+When you need more control over the schema (e.g. adding descriptions, setting types for arguments without defaults), pass an explicit `parameters` object:
+
+```r
+agent$add_tool(top_n,
+  name = "get_top_products",
+  description = "Look up the top N products by revenue from sales data",
+  parameters = list(
+    type = "object",
+    properties = list(
+      data = list(
+        type = "string",
+        description = "JSON string of the sales data frame"
+      ),
+      n = list(
+        type = "number",
+        description = "How many products to return (default 3)"
+      )
+    ),
+    required = c("data")
+  ))
+```
+
+### How argument types are inferred
+
+When you do not supply an explicit schema, `lg_tool_schema()` infers types from default values:
+
+| R default value | JSON schema type |
+|---|---|
+| `TRUE` / `FALSE` | `boolean` |
+| Numeric (`42`, `3.14`) | `number` |
+| Character string | `string` |
+| No default value | `string` (required) |
+
+Arguments without defaults are marked as **required** in the schema.
+
+---
+
+## Invoking the Agent
+
+```r
+result <- agent$invoke("What is 15 plus 27?")
+```
+
+`invoke()` drives the full tool loop: it sends your message, the model decides which tools to call, R executes them, results are fed back, and this repeats until the model produces a final answer.
+
+### Return value
+
+`invoke()` returns a list with:
+
+- `status` — `"completed"` when the run finished
+- `content` — the assistant's final reply text
+- `interrupts` — always empty for a completed run
+- `messages` — number of messages in the conversation so far
+
+### Max rounds
+
+By default the agent runs up to 10 tool rounds per `invoke()` call. You can adjust this:
+
+```r
+result <- agent$invoke("Complex multi-step task here", max_rounds = 20)
+```
+
+This is a safety guard against infinite tool loops.
+
+---
+
+## Multi-Tool Example
+
+An agent can use multiple tools in sequence:
+
+```r
+# Tool 1: load a CSV file
+load_sales <- function(filepath) {
+  read.csv(filepath)
+}
+
+# Tool 2: calculate summary statistics
+summarize_sales <- function(data) {
+  list(
+    total_revenue = sum(data$revenue),
+    avg_revenue = mean(data$revenue),
+    top_product = data$product[which.max(data$revenue)]
+  )
+}
+
+# Tool 3: generate a bar chart (returns path to saved plot)
+make_chart <- function(data) {
+  tmp <- tempfile(fileext = ".png")
+  png(tmp, width = 800, height = 500)
+  barplot(data$revenue, names.arg = data$product,
+          main = "Revenue by Product", col = "#5b5bd6")
+  dev.off()
+  tmp
+}
+
+agent$add_tool(load_sales,
+  description = "Load a CSV file of sales data")
+agent$add_tool(summarize_sales,
+  description = "Compute summary statistics from a sales data frame")
+agent$add_tool(make_chart,
+  description = "Create a bar chart of revenue by product; returns file path")
+
+result <- agent$invoke(paste(
+  "Load the file 'sales.csv', compute the summary stats,",
+  "and make a chart. Tell me what you found."
+))
+```
+
+The model will call the tools in whatever order it decides is appropriate.
+
+---
+
+## Conversation Memory
+
+Each agent object has a `thread_id`. The LangGraph checkpointer stores the conversation history per thread.
+
+```r
+# First turn
+agent$invoke("I have 3 apples and 5 oranges.")
+
+# Second turn — the agent remembers
+result <- agent$invoke("How many fruits do I have total?")
+result$content
+```
+
+### Starting fresh
+
+```r
+agent$reset()
+# Now the conversation is empty
+```
+
+### Reusing a thread across sessions
+
+Thread IDs are just strings. Save one and reuse it later:
+
+```r
+# Session 1
+agent <- lg_connect()
+agent$invoke("Remember: the server is on port 8123.")
+thread_id <- agent$thread_id
+# Save thread_id somewhere...
+
+# Session 2 (could be hours or days later)
+agent <- lg_connect(thread_id = thread_id)
+result <- agent$invoke("What port is the server on?")
+# The agent remembers
+```
+
+For durable memory that survives server restarts, see [Memory & Threads](memory-and-threads.html).
+
+---
+
+## Tool Execution Details
+
+### How arguments are decoded
+
+The model sends tool arguments as JSON. langgraphr automatically converts them to natural R types:
+
+- JSON arrays of scalars → atomic vectors
+- JSON arrays of objects → data frames
+- JSON objects → named lists
+- JSON strings that look like number lists → numeric vectors (e.g. `"1, 2, 3"` → `c(1, 2, 3)`)
+
+This means your R functions receive data in the forms you expect — you rarely need to manually parse JSON.
+
+### How return values are sent back
+
+Return values are automatically made JSON-safe:
+
+- Data frames → arrays of row objects
+- Lists → recursively converted
+- Atomic values → passed through unchanged
+
+You can return anything from a tool function; `langgraphr` handles the serialization.
+
+### Error handling
+
+If a tool function throws an error, the error message is sent back to the model as the tool result. The model can then try again with different arguments or adjust its approach. This all happens automatically — no special error handling needed in your tools.
+
+---
+
+## Multiple Agents
+
+You can create multiple agents with different tools and different threads:
+
+```r
+# Data analysis agent
+data_agent <- lg_connect(thread_id = "data_chat")
+data_agent$add_tool(summarize_sales)
+data_agent$add_tool(make_chart)
+
+# Math agent
+math_agent <- lg_connect(thread_id = "math_chat")
+math_agent$add_tool(add_numbers)
+```
+
+Each agent is independent — they share the same hidden server but have separate tool registries and conversation threads.
+
+---
+
+## Under the Hood
+
+The assistant graph is a standard LangGraph `StateGraph` with two nodes:
+
+```
+START → agent → (tools) → agent → END
+              ↓
+            tools
+              ↓
+            agent (loop)
+```
+
+- **`agent` node** — calls the LLM with all registered tools bound to it
+- **`tools` node** — executes tool calls. R-only tools trigger `interrupt()`, which pauses the run until R replies
+- **Conditional edge** — after `agent`, if there are tool calls, go to `tools`; otherwise go to `END`
+- After `tools`, always go back to `agent`
+
+This is the classic ReAct pattern — reasoning, acting, observing — all orchestrated by LangGraph.
+
+---
+
+## See Also
+
+- [Tools & Models](tools-and-models.html) — more on tool schemas and direct model calls
+- [Memory & Threads](memory-and-threads.html) — thread management and SQLite persistence
+- [Graph Authoring](graph-authoring.html) — build custom graphs when you need more control

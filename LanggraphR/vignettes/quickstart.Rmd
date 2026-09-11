@@ -1,0 +1,255 @@
+---
+title: "Quick Start"
+description: "Get up and running with langgraphr in under five minutes."
+vignette: >
+  %\VignetteIndexEntry{Quick Start}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Quick Start
+
+langgraphr gives you two ways to build agentic applications:
+
+1. **Assistant path** — a ready-to-use LLM agent whose tools are R functions. Best for chatbots, data analysts, and tool-using agents.
+2. **Graph authoring path** — build custom stateful graphs where each node is an R function. Best for workflows, pipelines, and multi-step logic.
+
+This guide covers both.
+
+## Prerequisites
+
+Before you begin, make sure you have:
+
+- R >= 4.1
+- Python >= 3.10
+- The `langgraphr` package installed (see [Prerequisites & Installation](installation.html))
+- An API key for an OpenAI-compatible model (DeepSeek, OpenAI, etc.)
+
+Set your model credentials as environment variables:
+
+```r
+Sys.setenv(LANGGRAPHR_API_KEY = "your-api-key")
+Sys.setenv(LANGGRAPHR_MODEL = "deepseek-chat")
+Sys.setenv(LANGGRAPHR_BASE_URL = "https://api.deepseek.com")
+```
+
+Or use a `.Renviron` file in your project root.
+
+---
+
+## Path 1: Assistant with R Tools
+
+The quickest way to build an agent. Register any R function as a tool — the LLM decides when to call it.
+
+### Step 1: Connect
+
+```r
+library(langgraphr)
+
+agent <- lg_connect()
+```
+
+This starts the hidden LangGraph server in the background and returns an `LgAgent` object. You only need to call `lg_connect()` once per session.
+
+### Step 2: Register a tool
+
+Write an R function and register it with the agent:
+
+```r
+# A simple calculator tool
+add_numbers <- function(a, b) {
+  a + b
+}
+
+agent$add_tool(add_numbers,
+  description = "Add two numbers together and return the result")
+```
+
+The LLM now knows about your function and can decide to call it.
+
+### Step 3: Chat
+
+```r
+result <- agent$invoke("What is 42 plus 58?")
+result$content
+```
+
+The agent will call your `add_numbers` function and return the answer.
+
+### What just happened
+
+1. Your message is sent to the hidden LangGraph server
+2. The LLM decides it needs to call `add_numbers`
+3. LangGraph pauses (interrupts) and asks R to run the function
+4. R runs `add_numbers(42, 58)` locally and returns `100`
+5. LangGraph resumes and the LLM produces the final answer
+
+Your R code runs in your R session — your data never leaves R.
+
+### A more realistic example
+
+```r
+# A data analysis tool
+top_products <- function(data, n = 3) {
+  head(data[order(data$revenue, decreasing = TRUE), ], n)
+}
+
+# Sample data
+sales <- data.frame(
+  product = c("Aurora", "Nimbus", "Ember", "Cascade", "Stratus"),
+  revenue = c(120.5, 340.2, 95, 210.8, 175.3),
+  units = c(12, 45, 8, 28, 21)
+)
+
+agent$add_tool(top_products,
+  description = "Return the top-N products by revenue from a sales data frame")
+
+result <- agent$invoke(paste(
+  "Here is the sales data:",
+  jsonlite::toJSON(sales, auto_unbox = TRUE),
+  "What are the top 2 products by revenue?"
+))
+
+result$content
+```
+
+---
+
+## Path 2: Custom Stateful Graphs
+
+Build your own graph structure with R functions as nodes. No LLM required — this is a pure state machine.
+
+### Step 1: Define the graph
+
+```r
+library(langgraphr)
+
+# Create a graph with a state channel
+g <- lg_graph("counter",
+  state = list(
+    count = list(type = "number", reducer = "overwrite")
+  ))
+```
+
+State channels are the variables your graph reads and writes. Each channel has a type and a reducer (how updates are applied).
+
+### Step 2: Add nodes
+
+Nodes are R functions that receive the current state and return updates plus the next node to visit.
+
+```r
+increment <- function(state) {
+  current <- state$count
+  if (is.null(current)) current <- as.numeric(state$input)
+
+  if (current < 5) {
+    list(
+      updates = list(count = current + 1),
+      goto = "increment"   # loop back to this node
+    )
+  } else {
+    list(
+      updates = list(count = current)
+      # no goto = graph ends
+    )
+  }
+}
+
+g <- g |> lg_add_node("increment", increment)
+```
+
+### Step 3: Compile and run
+
+```r
+graph <- lg_compile(g)
+result <- graph$invoke("0")
+
+result$state$count
+# 5
+```
+
+The graph starts at the entry node with `input = "0"`, loops incrementing the count, and stops when it reaches 5.
+
+### Multi-node graph with branching
+
+```r
+g <- lg_graph("classifier",
+  state = list(
+    value = list(type = "number"),
+    category = list(type = "str")
+  ))
+
+check_value <- function(state) {
+  val <- as.numeric(state$input)
+  if (val > 10) {
+    list(updates = list(value = val), goto = "high")
+  } else {
+    list(updates = list(value = val), goto = "low")
+  }
+}
+
+handle_high <- function(state) {
+  list(updates = list(category = "high"))
+}
+
+handle_low <- function(state) {
+  list(updates = list(category = "low"))
+}
+
+g <- g |>
+  lg_add_node("check", check_value) |>
+  lg_add_node("high", handle_high) |>
+  lg_add_node("low", handle_low) |>
+  lg_add_edge("check", "high") |>   # default edges for clarity
+  lg_add_edge("check", "low")
+
+graph <- lg_compile(g)
+
+result <- graph$invoke("15")
+result$state$category
+# "high"
+
+result2 <- graph$invoke("5")
+result2$state$category
+# "low"
+```
+
+---
+
+## Conversation Memory
+
+Both paths support memory across multiple turns via thread IDs.
+
+```r
+agent <- lg_connect()
+
+# First turn
+agent$invoke("My name is Alice and I work in data science.")
+
+# Second turn — the agent remembers
+result <- agent$invoke("What do I do for work?")
+result$content
+```
+
+Each `LgAgent` and `LgGraph` object has a `thread_id`. Reuse the same thread ID to continue a conversation, or generate a new one to start fresh:
+
+```r
+# Start fresh
+agent$reset()
+```
+
+For durable memory that survives server restarts, use SQLite:
+
+```r
+lg_use_sqlite("memory.sqlite")
+```
+
+---
+
+## Next Steps
+
+- **Assistant path** — Learn more in [Assistant Agents](assistant-agents.html)
+- **Graph authoring** — Learn more in [Graph Authoring](graph-authoring.html)
+- **Memory** — Dive into threads and persistence in [Memory & Threads](memory-and-threads.html)
+- **Tools & models** — Understand tool schemas and direct model calls in [Tools & Models](tools-and-models.html)
+- **Architecture** — Learn how it all works under the hood in [Architecture](architecture.html)

@@ -1,0 +1,114 @@
+title: langgraphr
+url: ~
+template:
+  bootstrap: 5
+  bslib:
+    primary: "#5b5bd6"
+    bg: "#f5f6fa"
+    fg: "#171b26"
+    base_font:
+      google: "Inter"
+    heading_font:
+      google: "Inter"
+    code_font:
+      google: "JetBrains Mono"
+
+home:
+  title: Agentic AI for R, powered by LangGraph
+  description: Build AI agents whose "hands" are R. The LLM decides what to do, and your R functions, data frames, models and plots do the work.
+  sidebar: false
+
+navbar:
+  structure:
+    left: [intro, articles, reference]
+    right: [search]
+  components:
+    intro:
+      text: Home
+      href: index.html
+    articles:
+      text: Guides
+      href: articles/index.html
+    reference:
+      text: Reference
+      href: reference/index.html
+
+articles:
+  - title: Get started
+    desc: Install, configure, and build your first agent in minutes.
+    contents:
+      - installation
+      - quickstart
+  - title: Core paths
+    desc: The two ways to build with langgraphr.
+    contents:
+      - assistant-agents
+      - graph-authoring
+  - title: Key concepts
+    desc: Understand the building blocks of agentic systems.
+    contents:
+      - memory-and-threads
+      - tools-and-models
+  - title: Design patterns
+    desc: Fundamental AI agent patterns implemented in pure R.
+    contents:
+      - design-patterns
+      - multi-agent-systems
+      - rag-patterns
+  - title: Recipes & extensions
+    desc: Complete applications and reusable helpers.
+    contents:
+      - advanced-recipes
+      - extending-langgraphr
+  - title: Deep dive
+    desc: Architecture, API comparison, and troubleshooting.
+    contents:
+      - architecture
+      - api-comparison
+      - faq
+
+reference:
+  - title: Connect & serve
+    desc: Start, stop and connect to the hidden LangGraph server.
+    contents:
+      - lg_connect
+      - lg_start_server
+      - lg_stop_server
+  - title: Assistant agents
+    desc: The quick path — an LLM assistant whose tools are R functions.
+    contents:
+      - LgAgent
+  - title: Graph authoring
+    desc: The full-authoring path — stateful graphs in pure R.
+    contents:
+      - lg_graph
+      - lg_add_node
+      - lg_add_edge
+      - lg_set_memory
+      - lg_compile
+      - LgGraph
+      - print.lg_graph_builder
+  - title: Tools & models
+    desc: Build tool schemas and call models directly.
+    contents:
+      - lg_tool_schema
+      - lg_call_model
+  - title: Memory
+    desc: Threads, ids and durability.
+    contents:
+      - lg_thread_id
+      - lg_new_thread
+      - lg_threads
+      - lg_use_sqlite
+  - title: Guides
+    desc: Interactive learning.
+    contents:
+      - lg_tour
+
+footer:
+  structure:
+    left: [developed_by]
+    right: [built_with]
+  components:
+    built_with:
+      text: "Built with pkgdown"

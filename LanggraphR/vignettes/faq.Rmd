@@ -1,0 +1,324 @@
+---
+title: "FAQ & Troubleshooting"
+description: "Common questions, known issues, and how to fix them."
+vignette: >
+  %\VignetteIndexEntry{FAQ & Troubleshooting}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# FAQ & Troubleshooting
+
+Answers to common questions about langgraphr. If you do not find your issue here, check the server log.
+
+---
+
+## Getting Started
+
+### Do I need to know Python?
+
+No. You write pure R. The Python server is an implementation detail — like the C code behind `lm()`.
+
+### Do I need an API key?
+
+It depends on what you are doing:
+
+- **Graph authoring (pure state machines)** — no API key needed. No model calls at all.
+- **Assistant agents** — yes, you need an API key for an OpenAI-compatible model.
+- **`lg_call_model()`** — yes, same as above.
+
+Run `lg_tour(1)` to see a pure-R graph demo with no key required.
+
+### What models are supported?
+
+Any OpenAI-compatible chat model. This includes:
+
+- OpenAI (GPT-4o, GPT-4o-mini, etc.)
+- DeepSeek
+- Ollama (local models)
+- vLLM
+- Any other provider with an OpenAI-compatible endpoint
+
+Set `LANGGRAPHR_BASE_URL` to point at your provider.
+
+---
+
+## Installation
+
+### How do I install langgraphr?
+
+See [Prerequisites & Installation](installation.html). The short version:
+
+```r
+remotes::install_local("LanggraphR")
+```
+
+Then run the setup script once:
+```powershell
+LanggraphR/scripts/setup_server.ps1
+```
+
+### What are the system requirements?
+
+- **R >= 4.1**
+- **Python >= 3.10** (or `uv` — the setup script handles the rest)
+- An OpenAI-compatible API key (for LLM features)
+
+### Where does the Python virtual environment live?
+
+In `LanggraphR/inst/server/.venv/`. The setup script creates it, and the server auto-discovers it.
+
+### Can I use a custom Python environment?
+
+Yes. Set the `langgraphr.python` option or `LANGGRAPHR_PYTHON` environment variable to the path of your Python executable:
+
+```r
+options(langgraphr.python = "path/to/your/python")
+```
+
+Or use an environment variable before starting R:
+```bash
+export LANGGRAPHR_PYTHON=/path/to/python
+```
+
+---
+
+## Server Management
+
+### The server will not start
+
+Check the server log. By default it writes to a temp file — pass `logfile` to see it:
+
+```r
+lg_start_server(logfile = "server.log")
+```
+
+Common causes:
+
+- **Python not found** — install Python >= 3.10 or run `setup_server.ps1`
+- **Port already in use** — another process is on port 8123. Use a different port:
+  ```r
+  options(langgraphr.port = 9000)
+  lg_connect(port = 9000)
+  ```
+- **Missing Python dependencies** — re-run `scripts/setup_server.ps1`
+
+### The server starts but model calls fail
+
+This is usually a network or credentials issue:
+
+1. **Check your API key** — make sure `LANGGRAPHR_API_KEY` is set correctly
+2. **Check the base URL** — `LANGGRAPHR_BASE_URL` must point to a valid endpoint
+3. **Proxy / VPN issues** — langgraphr auto-retries on alternate routes, but some networks are tricky. Try toggling your VPN.
+
+### How do I change the server port?
+
+```r
+options(langgraphr.port = 9000)
+```
+
+Set this before calling `lg_connect()` or `lg_start_server()`.
+
+### How do I see server logs?
+
+```r
+lg_start_server(logfile = "server.log", debug = TRUE)
+```
+
+Or set `options(langgraphr.debug = TRUE)` to print logs to the R console.
+
+### Can I run the server manually?
+
+Yes — useful for debugging:
+
+```powershell
+cd LanggraphR/inst/server
+.venv/Scripts/python.exe -m uvicorn app:app --host 127.0.0.1 --port 8123
+```
+
+Then connect from R with `lg_connect()` — it will see the already-running server and reuse it.
+
+---
+
+## Tools & Agents
+
+### My tool is not being called
+
+Check:
+
+1. Is the tool registered? Print `agent$tools` to see registered tool names.
+2. Is the description clear enough? The LLM uses the description to decide when to call a tool.
+3. Try a more explicit prompt — tell the model to use the tool.
+
+### The model sends arguments in the wrong format
+
+When the inferred schema is not precise enough (e.g. an argument without a default is typed as "string"), the model may send data in unexpected formats. langgraphr does its best to coerce (comma-separated numbers become vectors, JSON arrays in strings are parsed), but for production use an explicit schema:
+
+```r
+agent$add_tool(my_function,
+  description = "...",
+  parameters = list(
+    type = "object",
+    properties = list(
+      numbers = list(
+        type = "array",
+        items = list(type = "number"),
+        description = "A list of numbers to process"
+      )
+    ),
+    required = c("numbers")
+  ))
+```
+
+### Can I register tools after the first invoke?
+
+Yes. You can add tools at any time — even in the middle of a conversation. The newly registered tool will be available on the next `invoke()`.
+
+### How many tools can I register?
+
+There is no hard limit. However, the LLM's context window is the practical constraint — each tool's schema counts against the context. For best results, keep tool descriptions concise and only register tools the agent actually needs.
+
+---
+
+## Memory & Threads
+
+### The agent forgets between calls
+
+Make sure you are reusing the same `LgAgent` object (and therefore the same `thread_id`). If you create a new agent with `lg_connect()`, it gets a new thread ID and starts fresh.
+
+To verify:
+```r
+agent$thread_id
+```
+
+### Conversation memory does not persist across sessions
+
+By default, memory is in-process and is lost when the server stops. For durable memory, use SQLite:
+
+```r
+lg_use_sqlite("memory.sqlite")
+```
+
+Then restart the server. See [Memory & Threads](memory-and-threads.html) for details.
+
+### Can I share a thread between agents?
+
+Yes. Just pass the same `thread_id`:
+
+```r
+agent1 <- lg_connect(thread_id = "shared_convo")
+agent2 <- lg_connect(thread_id = "shared_convo")
+```
+
+Both agents share the same conversation history. Note: concurrent writes to the same thread can cause race conditions.
+
+---
+
+## Graph Authoring
+
+### My graph runs but returns unexpected state
+
+Check:
+
+1. Are you using the right reducer? `"append"` adds to a list; `"overwrite"` replaces the value.
+2. Are you returning `updates` correctly? The `updates` list must be a named list whose names match state channel names.
+3. Is the entry node correct? The first node added is the default entry. Use the `entry` parameter of `lg_graph()` to set it explicitly.
+
+### What is the `input` channel?
+
+Every graph gets an `input` channel automatically. It receives the argument you pass to `$invoke()`, always as a string. The `input` channel uses the `overwrite` reducer — it is set fresh at the start of each `invoke()`.
+
+### Can I pass non-string input?
+
+The `input` channel is always a string. For complex input, encode it as JSON and decode it in your first node:
+
+```r
+# R side
+graph$invoke(jsonlite::toJSON(list(a = 1, b = 2)))
+
+# In your node function
+first_node <- function(state) {
+  input <- jsonlite::fromJSON(state$input)
+  # input$a, input$b...
+}
+```
+
+### How do I debug a graph?
+
+Add logging to your node functions:
+
+```r
+my_node <- function(state) {
+  cat("my_node called. State:", str(state), "\n")
+  # ... your logic
+  result <- list(updates = list(...), goto = "next")
+  cat("my_node returning:", str(result), "\n")
+  result
+}
+```
+
+---
+
+## Network Issues
+
+### Model calls fail when my VPN is on (or off)
+
+langgraphr has built-in resilience for this — it should automatically detect and retry. If you are seeing consistent failures:
+
+1. Try explicitly setting the proxy mode:
+   ```r
+   lg_stop_server()
+   lg_start_server(proxy = "direct")    # bypass proxies
+   # or
+   lg_start_server(proxy = "system")    # force system proxy
+   ```
+
+2. If you are on a corporate VPN, the R relay fallback should engage automatically. You will see a message like:
+   ```
+   Model connection failed on every route; forwarding model traffic
+   through a local R relay...
+   ```
+
+### What is the "local R relay"?
+
+When the Python server cannot reach the model API (e.g. VPN TLS issues), langgraphr starts a tiny HTTP proxy inside the R process. The Python server sends model requests to the relay, and R forwards them using its own `curl`/`httr2` stack (which uses OS-level TLS and often works when Python's does not).
+
+This is fully automatic — no configuration needed.
+
+---
+
+## Comparing Approaches
+
+### How is this different from reticulate?
+
+reticulate lets you call Python from R in-process. langgraphr hides Python entirely — it is a separate server process that you talk to over HTTP. Your R code stays pure R, and you never import Python modules.
+
+See [Architecture](architecture.html) for a detailed comparison.
+
+### Why not just use an HTTP API wrapper?
+
+A plain HTTP wrapper (e.g. calling OpenAI's API directly from R) gives you model calls but not agent orchestration — no tool loop, no state management, no checkpoints, no graph-based workflows. langgraphr gives you all of that via LangGraph, while keeping your code in R.
+
+### Can I use langgraphr with Shiny?
+
+Yes. The agent and graph objects work naturally in Shiny apps. Each user session should have its own thread ID. See the example projects in the `projects/` folder.
+
+---
+
+## Known Limitations
+
+- **Parallel node execution** (LangGraph's `Send` fan-out) is not yet implemented. Graphs run single-path.
+- **Streaming responses** are not yet supported — `invoke()` returns the complete result.
+- **SQLite persistence** is best-effort — it works but has not been stress-tested at scale.
+- **Server crashes** can expose Python tracebacks in the log — this is the one place where the "no Python" abstraction leaks.
+
+---
+
+## Getting Help
+
+If you are stuck:
+
+1. Read the relevant vignette — most topics are covered in depth
+2. Check the server log with `lg_start_server(logfile = ...)`
+3. Run `lg_tour()` for interactive demos that demonstrate each feature
+4. Try the examples in the `projects/` folder

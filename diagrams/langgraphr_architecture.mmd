@@ -1,0 +1,14 @@
+flowchart TD
+    A["STEP 1<br/>Write your graph in R<br/>(each node = one of your R functions)"]
+    B["STEP 2<br/>lg_compile()<br/>sends the blueprint to the Python server"]
+    C["STEP 3<br/>graph$invoke('question')<br/>sends the question to start the run"]
+    D["STEP 4<br/>Python starts the run,<br/>pauses at the first node,<br/>sends the current state to R"]
+    E["STEP 5<br/>R runs YOUR node function<br/>(lg_call_model() talks to the LLM here)"]
+    F["STEP 6<br/>R sends the result + next-node<br/>choice back to Python"]
+    G{"STEP 7<br/>Any more nodes?"}
+    H["STEP 8<br/>A node said '__end__',<br/>so Python sends the final state back"]
+    I["STEP 9<br/>You read the answer:<br/>res$state$answer"]
+
+    A --> B --> C --> D --> E --> F --> G
+    G -->|"yes: next node pauses"| E
+    G -->|"no"| H --> I

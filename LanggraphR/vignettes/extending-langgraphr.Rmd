@@ -1,0 +1,687 @@
+---
+title: "Extending langgraphr"
+description: "Write your own helper functions, custom patterns, and reusable components on top of langgraphr."
+vignette: >
+  %\VignetteIndexEntry{Extending langgraphr}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Extending langgraphr
+
+langgraphr gives you the building blocks. This guide shows how to write reusable R helper functions that add higher-level abstractions — message management, prompt templates, structured output, custom reducers, and more.
+
+---
+
+## Message Helpers
+
+### Build message lists
+
+langgraphr uses plain R lists for messages. These helpers make them easier to construct:
+
+```r
+#' Create a system message
+sys_msg <- function(content) {
+  list(role = "system", content = content)
+}
+
+#' Create a user message
+user_msg <- function(content) {
+  list(role = "user", content = content)
+}
+
+#' Create an assistant message
+assistant_msg <- function(content) {
+  list(role = "assistant", content = content)
+}
+
+#' Create a tool result message
+tool_msg <- function(content, tool_call_id = NULL) {
+  msg <- list(role = "tool", content = content)
+  if (!is.null(tool_call_id)) msg$tool_call_id <- tool_call_id
+  msg
+}
+
+# Usage
+messages <- list(
+  sys_msg("You are a helpful assistant."),
+  user_msg("What is R?")
+)
+result <- lg_call_model(messages)
+```
+
+### Conversation builder
+
+```r
+#' Build a conversation from a simpler interface
+conversation <- function() {
+  msgs <- list()
+
+  list(
+    system = function(content) {
+      msgs <<- c(msgs, list(sys_msg(content)))
+      invisible(self)
+    },
+    user = function(content) {
+      msgs <<- c(msgs, list(user_msg(content)))
+      invisible(self)
+    },
+    assistant = function(content) {
+      msgs <<- c(msgs, list(assistant_msg(content)))
+      invisible(self)
+    },
+    messages = function() msgs,
+    send = function() {
+      lg_call_model(msgs)
+    }
+  )
+}
+
+# Usage
+conv <- conversation()
+conv$system("You are a code reviewer.")
+conv$user("Review this function: add <- function(a, b) a + b")
+response <- conv$send()
+```
+
+---
+
+## Prompt Templates
+
+### Template engine
+
+```r
+#' Create a prompt template
+#' @param template String with {placeholders}
+#' @return A function that fills in the template
+prompt_template <- function(template) {
+  function(...) {
+    args <- list(...)
+    result <- template
+    for (name in names(args)) {
+      result <- gsub(paste0("{", name, "}"), args[[name]], result, fixed = TRUE)
+    }
+    result
+  }
+}
+
+# Usage
+summarize_prompt <- prompt_template(
+  "Summarize the following {type} in {max_points} key points:\n\n{content}"
+)
+
+prompt <- summarize_prompt(type = "article", max_points = 3, content = "...")
+result <- lg_call_model(list(user_msg(prompt)))
+```
+
+### Few-shot prompt builder
+
+```r
+#' Build a few-shot prompt with examples
+#' @param instruction System instruction
+#' @param examples List of list(input, output) pairs
+#' @return A function(query) that builds the full prompt
+few_shot <- function(instruction, examples) {
+  function(query) {
+    msgs <- list(sys_msg(instruction))
+
+    for (ex in examples) {
+      msgs <- c(msgs, list(
+        user_msg(ex$input),
+        assistant_msg(ex$output)
+      ))
+    }
+
+    c(msgs, list(user_msg(query)))
+  }
+}
+
+# Usage
+classifier <- few_shot(
+  instruction = "Classify the sentiment as POSITIVE, NEGATIVE, or NEUTRAL.",
+  examples = list(
+    list(input = "I love this product!", output = "POSITIVE"),
+    list(input = "Terrible experience.", output = "NEGATIVE"),
+    list(input = "It arrived on Tuesday.", output = "NEUTRAL")
+  )
+)
+
+result <- lg_call_model(classifier("The quality exceeded my expectations"))
+```
+
+---
+
+## Structured Output
+
+LangGraph uses Pydantic for structured output. In R, you can enforce structure with prompt engineering and parsing.
+
+### JSON output
+
+```r
+#' Call the model with a JSON schema and parse the result
+#' @param messages Message list
+#' @param schema Named list describing the expected JSON structure
+#' @return Parsed JSON as R list
+lg_call_structured <- function(messages, schema) {
+  # Add JSON instruction to the system message
+  schema_str <- jsonlite::toJSON(schema, auto_unbox = TRUE, pretty = TRUE)
+
+  messages[[1]]$content <- paste(
+    messages[[1]]$content,
+    "\n\nRespond with ONLY valid JSON matching this structure:",
+    schema_str,
+    "\nDo not include markdown code blocks or any other text."
+  )
+
+  raw <- lg_call_model(messages, temperature = 0)
+
+  # Clean and parse
+  cleaned <- gsub("```json|```", "", raw)
+  cleaned <- trimws(cleaned)
+
+  tryCatch(
+    jsonlite::fromJSON(cleaned),
+    error = function(e) {
+      # Retry once with explicit reminder
+      messages[[length(messages) + 1]] <- assistant_msg(raw)
+      messages[[length(messages) + 1]] <- user_msg(
+        "That was not valid JSON. Return ONLY a JSON object matching the schema."
+      )
+      raw2 <- lg_call_model(messages, temperature = 0)
+      cleaned2 <- gsub("```json|```", "", raw2)
+      jsonlite::fromJSON(trimws(cleaned2))
+    }
+  )
+}
+
+# Usage
+schema <- list(
+  sentiment = "string (POSITIVE, NEGATIVE, NEUTRAL)",
+  confidence = "number (0-1)",
+  key_topics = "array of strings"
+)
+
+result <- lg_call_structured(
+  list(sys_msg("Analyze the sentiment of the user message."),
+       user_msg("The new R package is amazing — fast and well-documented!")),
+  schema
+)
+# $sentiment: "POSITIVE"
+# $confidence: 0.95
+# $key_topics: ["R package", "performance", "documentation"]
+```
+
+### R-to-JSON schema
+
+```r
+#' Convert an R list schema description to a JSON schema string
+#' @param fields Named list of list(type, description)
+to_json_schema <- function(fields) {
+  properties <- lapply(fields, function(f) {
+    list(type = f$type, description = f$description %||% "")
+  })
+  list(
+    type = "object",
+    properties = properties,
+    required = names(fields)
+  )
+}
+
+# Usage
+schema <- to_json_schema(list(
+  name = list(type = "string", description = "Person's full name"),
+  age = list(type = "number", description = "Age in years"),
+  skills = list(type = "array", description = "List of skills")
+))
+```
+
+---
+
+## Custom Reducers
+
+langgraphr supports `overwrite` and `append` reducers. Here is how to simulate more complex reducer behavior in node functions.
+
+### Max reducer (keep the maximum value)
+
+```r
+# Instead of a custom "max" reducer, do this in the node:
+max_node <- function(state) {
+  current <- state$score %||% 0
+  new_score <- compute_score()
+  final_score <- max(current, new_score)
+
+  list(updates = list(score = final_score))  # overwrite with max
+}
+```
+
+### Merge reducer (combine two data frames)
+
+```r
+merge_node <- function(state) {
+  existing <- state$data %||% data.frame()
+  new_rows <- fetch_new_data()
+
+  merged <- rbind(existing, new_rows)
+
+  list(updates = list(data = merged))  # overwrite with merged
+}
+```
+
+### Deduplicate reducer (keep unique items in a list)
+
+```r
+dedupe_node <- function(state) {
+  items <- state$items %||% list()
+
+  # Add new item
+  new_item <- get_new_item()
+  all_items <- c(items, list(new_item))
+
+  # Deduplicate by content
+  seen <- c()
+  unique_items <- list()
+  for (item in all_items) {
+    key <- digest::digest(item)  # or jsonlite::toJSON(item)
+    if (!(key %in% seen)) {
+      seen <- c(seen, key)
+      unique_items <- c(unique_items, list(item))
+    }
+  }
+
+  list(updates = list(items = unique_items))  # overwrite with deduplicated
+}
+```
+
+---
+
+## State Utilities
+
+### Safe state access
+
+```r
+#' Get a state value with a default (like ?? in JavaScript)
+#' @param state The graph state list
+#' @param key The state channel name
+#' @param default Default value if missing
+state_get <- function(state, key, default = NULL) {
+  val <- state[[key]]
+  if (is.null(val) || (is.character(val) && !nzchar(val))) default else val
+}
+
+# Usage in a node
+my_node <- function(state) {
+  count <- state_get(state, "count", 0)
+  history <- state_get(state, "history", list())
+  # ...
+}
+```
+
+### State inspection
+
+```r
+#' Print the current state (useful for debugging)
+print_state <- function(state) {
+  cat("=== Current State ===\n")
+  for (key in names(state)) {
+    val <- state[[key]]
+    if (is.data.frame(val)) {
+      cat(key, ":\n"); print(head(val, 3))
+    } else if (is.list(val) && length(val) > 0) {
+      cat(key, ":", length(val), "items\n")
+      str(head(val, 3))
+    } else if (is.character(val)) {
+      cat(key, ":", substr(val, 1, 100), "\n")
+    } else {
+      cat(key, ":", val, "\n")
+    }
+  }
+  cat("=====================\n")
+}
+
+# Use in a node for debugging
+debug_node <- function(state) {
+  print_state(state)
+  # ... your logic
+}
+```
+
+---
+
+## Reusable Graph Builders
+
+### Linear pipeline builder
+
+```r
+#' Create a linear pipeline graph from a list of node functions
+#' @param name Graph name
+#' @param nodes Named list of node functions
+#' @return A compiled LgGraph
+linear_pipeline <- function(name, nodes) {
+  node_names <- names(nodes)
+
+  # All pipelines share the same simple state
+  g <- lg_graph(name,
+    state = list(
+      input = list(type = "str", reducer = "overwrite"),
+      output = list(type = "str", reducer = "overwrite"),
+      step_count = list(type = "number", reducer = "overwrite")
+    ))
+
+  # Add each node
+  for (nm in node_names) {
+    g <- lg_add_node(g, nm, nodes[[nm]])
+  }
+
+  # Chain them together
+  for (i in seq_len(length(node_names) - 1)) {
+    g <- lg_add_edge(g, node_names[i], node_names[i + 1])
+  }
+
+  lg_compile(g)
+}
+
+# Usage
+pipeline <- linear_pipeline("text_pipeline", list(
+  extract = function(state) {
+    result <- lg_call_model(list(user_msg(paste("Extract key points:", state$input))))
+    list(updates = list(output = result))
+  },
+  expand = function(state) {
+    result <- lg_call_model(list(user_msg(paste("Expand:", state$output))))
+    list(updates = list(output = result))
+  },
+  polish = function(state) {
+    result <- lg_call_model(list(user_msg(paste("Polish:", state$output))))
+    list(updates = list(output = result))
+  }
+))
+
+result <- pipeline$invoke("R is great for data science")
+```
+
+### Conditional router builder
+
+```r
+#' Create a routing graph from a classifier function and handler functions
+#' @param name Graph name
+#' @param classifier_fn Function(state) -> string (route key)
+#' @param handlers Named list of handler functions
+#' @return A compiled LgGraph
+route_graph <- function(name, classifier_fn, handlers) {
+  handler_names <- names(handlers)
+
+  g <- lg_graph(name,
+    state = list(
+      input = list(type = "str", reducer = "overwrite"),
+      route = list(type = "str", reducer = "overwrite"),
+      output = list(type = "str", reducer = "overwrite")
+    ))
+
+  # The classifier node
+  classify_fn <- function(state) {
+    route <- classifier_fn(state)
+    goto <- if (route %in% handler_names) route else handler_names[1]
+    list(updates = list(input = state$input, route = route), goto = goto)
+  }
+
+  g <- lg_add_node(g, "classify", classify_fn)
+
+  # Each handler
+  for (nm in handler_names) {
+    g <- lg_add_node(g, nm, handlers[[nm]])
+  }
+
+  lg_compile(g)
+}
+
+# Usage
+graph <- route_graph("support_router",
+  classifier_fn = function(state) {
+    text <- tolower(state$input)
+    if (grepl("billing|charge|payment|refund", text)) "billing"
+    else if (grepl("error|bug|install|crash", text)) "technical"
+    else "general"
+  },
+  handlers = list(
+    billing = function(state) {
+      result <- lg_call_model(list(sys_msg("You are a billing specialist."), user_msg(state$input)))
+      list(updates = list(output = result))
+    },
+    technical = function(state) {
+      result <- lg_call_model(list(sys_msg("You are a tech support agent."), user_msg(state$input)))
+      list(updates = list(output = result))
+    },
+    general = function(state) {
+      result <- lg_call_model(list(sys_msg("You are a helpful assistant."), user_msg(state$input)))
+      list(updates = list(output = result))
+    }
+  )
+)
+```
+
+### Loop builder (with max iterations)
+
+```r
+#' Create a graph that loops a node until a condition is met
+#' @param name Graph name
+#' @param body_fn The node function to repeat
+#' @param condition_fn Function(state) -> TRUE to continue, FALSE to stop
+#' @param max_iterations Safety cap
+#' @return A compiled LgGraph
+loop_graph <- function(name, body_fn, condition_fn, max_iterations = 10) {
+  g <- lg_graph(name,
+    state = list(
+      input = list(type = "str", reducer = "overwrite"),
+      iteration = list(type = "number", reducer = "overwrite"),
+      output = list(type = "str", reducer = "overwrite")
+    ))
+
+  loop_fn <- function(state) {
+    iter <- (state$iteration %||% 0) + 1
+
+    # Run the body
+    result <- body_fn(state)
+
+    # Check condition
+    new_state <- modifyList(state, result$updates %||% list())
+    new_state$iteration <- iter
+
+    should_continue <- condition_fn(new_state) && iter < max_iterations
+
+    if (should_continue) {
+      c(result, list(updates = c(result$updates %||% list(), list(iteration = iter)),
+                     goto = "loop"))
+    } else {
+      c(result, list(updates = c(result$updates %||% list(), list(iteration = iter))))
+    }
+  }
+
+  g <- g |>
+    lg_add_node("loop", loop_fn) |>
+    lg_add_edge("loop", "loop") |>
+    lg_compile()
+
+  g
+}
+
+# Usage: keep refining until the answer is long enough
+refiner <- loop_graph(
+  "text_refiner",
+  body_fn = function(state) {
+    text <- state$output %||% state$input
+    improved <- lg_call_model(list(
+      sys_msg("Improve the text. Make it more detailed."),
+      user_msg(text)
+    ))
+    list(updates = list(output = improved))
+  },
+  condition_fn = function(state) {
+    nchar(state$output %||% "") < 200
+  },
+  max_iterations = 5
+)
+```
+
+---
+
+## Prompt Library
+
+A collection of reusable system prompts for common agent types:
+
+```r
+prompts <- list(
+  data_analyst = paste(
+    "You are a data analyst. You help users understand their data.",
+    "When given a data frame, you summarize, analyze, and visualize.",
+    "Always explain your methodology and interpret results."
+  ),
+
+  code_reviewer = paste(
+    "You are an R code reviewer. You check for:",
+    "- Correctness and logic errors",
+    "- Performance issues",
+    "- Style and readability",
+    "- Security vulnerabilities",
+    "Provide specific, actionable feedback with code examples."
+  ),
+
+  technical_writer = paste(
+    "You are a technical writer. You create clear, accurate documentation.",
+    "Use active voice, define jargon, and include examples.",
+    "Structure content with headings and bullet points."
+  ),
+
+  researcher = paste(
+    "You are a research assistant. You find, synthesize, and present information.",
+    "Distinguish between facts and inferences.",
+    "Cite sources when possible."
+  ),
+
+  tutor = paste(
+    "You are a patient, encouraging tutor.",
+    "Explain concepts step by step.",
+    "Use analogies and examples.",
+    "Check understanding by asking questions."
+  ),
+
+  summarizer = paste(
+    "You are a summarizer. You create concise, accurate summaries.",
+    "Capture key points and main conclusions.",
+    "Preserve the author's intent and tone."
+  )
+)
+
+# Usage
+agent <- lg_connect()
+result <- agent$invoke("Explain linear regression")
+# Or with a graph node:
+node <- function(state) {
+  result <- lg_call_model(list(
+    sys_msg(prompts$tutor),
+    user_msg(state$input)
+  ))
+  list(updates = list(output = result))
+}
+```
+
+---
+
+## Model Configuration Helper
+
+```r
+#' Configure langgraphr with a specific provider
+#' @param provider One of "openai", "deepseek", "ollama", "custom"
+#' @param api_key API key (or NULL for local models)
+#' @param model Model name
+#' @param base_url Custom base URL (for custom provider)
+lg_config <- function(provider = c("deepseek", "openai", "ollama", "custom"),
+                      api_key = NULL, model = NULL, base_url = NULL) {
+  provider <- match.arg(provider)
+
+  config <- switch(provider,
+    openai = list(
+      base_url = "https://api.openai.com/v1",
+      model = model %||% "gpt-4o-mini",
+      key = api_key %||% Sys.getenv("OPENAI_API_KEY")
+    ),
+    deepseek = list(
+      base_url = "https://api.deepseek.com",
+      model = model %||% "deepseek-chat",
+      key = api_key %||% Sys.getenv("DEEPSEEK_API_KEY")
+    ),
+    ollama = list(
+      base_url = "http://localhost:11434/v1",
+      model = model %||% "llama3.2",
+      key = api_key %||% "ollama"  # ollama ignores the key
+    ),
+    custom = list(
+      base_url = base_url,
+      model = model,
+      key = api_key
+    )
+  )
+
+  if (nzchar(config$key)) {
+    Sys.setenv(LANGGRAPHR_API_KEY = config$key)
+  }
+  if (!is.null(config$base_url)) {
+    Sys.setenv(LANGGRAPHR_BASE_URL = config$base_url)
+  }
+  if (!is.null(config$model)) {
+    Sys.setenv(LANGGRAPHR_MODEL = config$model)
+  }
+
+  invisible(config)
+}
+
+# Usage
+lg_config("deepseek", api_key = "sk-...")
+lg_config("ollama")  # local, no key needed
+lg_config("openai", model = "gpt-4o")
+```
+
+---
+
+## Logging and Observability
+
+```r
+#' Create a logging wrapper for node functions
+#' @param fn A node function
+#' @param name Node name for logging
+#' @return A wrapped function that logs entry/exit
+logged_node <- function(fn, name) {
+  function(state) {
+    cat(sprintf("[%s] ENTER at %s\n", name, format(Sys.time())))
+    start <- Sys.time()
+
+    result <- tryCatch(
+      fn(state),
+      error = function(e) {
+        cat(sprintf("[%s] ERROR: %s\n", name, e$message))
+        stop(e)
+      }
+    )
+
+    elapsed <- round(as.numeric(difftime(Sys.time(), start, units = "secs")), 3)
+    cat(sprintf("[%s] EXIT after %ss\n", name, elapsed))
+
+    result
+  }
+}
+
+# Usage: wrap your node functions
+graph <- lg_graph("debug_demo",
+  state = list(value = list(type = "str"))) |>
+  lg_add_node("step1", logged_node(step1_fn, "step1")) |>
+  lg_add_node("step2", logged_node(step2_fn, "step2")) |>
+  lg_compile()
+```
+
+---
+
+## See Also
+
+- [Design Patterns](design-patterns.html) — patterns these helpers support
+- [Advanced Recipes](advanced-recipes.html) — complete applications
+- [Tools & Models](tools-and-models.html) — the base API
+- [Graph Authoring](graph-authoring.html) — the graph DSL

@@ -1,0 +1,709 @@
+---
+title: "Agent Design Patterns"
+description: "Core AI agent design patterns you can build with langgraphr in pure R."
+vignette: >
+  %\VignetteIndexEntry{Agent Design Patterns}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Agent Design Patterns
+
+Every agentic system is a variation on a few fundamental patterns. This guide covers the six core patterns from the LangGraph ecosystem and shows how to implement each one in pure R using langgraphr.
+
+---
+
+## Pattern Overview
+
+| Pattern | What it does | When to use |
+|---|---|---|
+| **ReAct** | LLM reasons, acts (calls tools), observes, repeats | General-purpose assistant with tools |
+| **Prompt chaining** | Output of one LLM call feeds the next | Multi-step transformation, structured generation |
+| **Routing** | Classify input, send to a specialist node | Intent detection, customer support routing |
+| **Orchestrator-worker** | One LLM plans, workers execute in parallel-ish | Complex tasks that decompose into subtasks |
+| **Evaluator-optimizer** | Generate, critique, refine until quality bar met | Writing, code, any quality-sensitive output |
+| **Plan-and-execute** | LLM creates a plan, then executes each step | Long-horizon multi-step tasks |
+
+---
+
+## 1. ReAct Agent
+
+The ReAct pattern is what `lg_connect()` gives you out of the box. The LLM reasons about what to do, calls tools, observes results, and repeats until it has an answer.
+
+```r
+library(langgraphr)
+
+agent <- lg_connect()
+
+# Register tools
+get_weather <- function(city) {
+  # In production, call a real weather API
+  paste("Weather in", city, ": 22C, sunny")
+}
+
+calculate <- function(expression) {
+  tryCatch(
+    as.character(eval(parse(text = expression))),
+    error = function(e) paste("Error:", e$message)
+  )
+}
+
+agent$add_tool(get_weather, description = "Get current weather for a city")
+agent$add_tool(calculate, description = "Evaluate a math expression like '2 + 3 * 4'")
+
+result <- agent$invoke("What is the weather in Tokyo, and what is 15% of 240?")
+result$content
+```
+
+**How it works internally:**
+```
+START → call_model → should_use_tools? → tools → call_model → ... → END
+                           ↓ (no tools)
+                          END
+```
+
+The LLM sees your tool schemas, decides when to call them, and the results are fed back as observations. This is the standard ReAct loop — reasoning, acting, observing.
+
+### Custom ReAct with graph authoring
+
+For more control over the ReAct loop, build it as a graph:
+
+```r
+react_graph <- lg_graph("custom_react",
+  state = list(
+    messages = list(type = "list", reducer = "append"),
+    tool_results = list(type = "list", reducer = "append"),
+    final_answer = list(type = "str", reducer = "overwrite")
+  ))
+
+reason_node <- function(state) {
+  # Call the LLM with conversation history
+  response <- lg_call_model(state$messages)
+
+  list(
+    updates = list(messages = list(role = "assistant", content = response)),
+    goto = "decide"
+  )
+}
+
+decide_node <- function(state) {
+  last_msg <- state$messages[[length(state$messages)]]
+
+  # In production, check if the LLM wants to call a tool
+  # For now, route to END if we have an answer
+  if (grepl("FINAL:", last_msg$content)) {
+    list(updates = list(final_answer = sub("FINAL:", "", last_msg$content)))
+  } else {
+    list(updates = list(tool_results = "pending"), goto = "execute_tool")
+  }
+}
+
+execute_tool_node <- function(state) {
+  # Execute whatever tool the LLM requested
+  # Feed result back as a tool message
+  result <- "tool output here"
+
+  list(
+    updates = list(
+      tool_results = result,
+      messages = list(role = "tool", content = result)
+    ),
+    goto = "reason"
+  )
+}
+
+graph <- react_graph |>
+  lg_add_node("reason", reason_node) |>
+  lg_add_node("decide", decide_node) |>
+  lg_add_node("execute_tool", execute_tool_node) |>
+  lg_add_edge("reason", "decide") |>
+  lg_add_edge("execute_tool", "reason") |>
+  lg_compile()
+```
+
+---
+
+## 2. Prompt Chaining
+
+Chain multiple LLM calls in sequence, where each call transforms the output of the previous one. This is the simplest multi-step pattern.
+
+```r
+chaining_graph <- lg_graph("prompt_chain",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    step1_output = list(type = "str", reducer = "overwrite"),
+    step2_output = list(type = "str", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite")
+  ))
+
+# Step 1: Extract key points from raw text
+extract_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system",
+         content = "Extract 3 key points from the text. Format: one point per line."),
+    list(role = "user", content = state$input)
+  ))
+
+  list(updates = list(step1_output = result), goto = "expand")
+}
+
+# Step 2: Expand each point into a paragraph
+expand_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system",
+         content = "Expand these key points into full paragraphs. One paragraph per point."),
+    list(role = "user", content = state$step1_output)
+  ))
+
+  list(updates = list(step2_output = result), goto = "polish")
+}
+
+# Step 3: Polish the final output
+polish_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system",
+         content = "Polish this text for clarity and flow. Return only the final text."),
+    list(role = "user", content = state$step2_output)
+  ))
+
+  list(updates = list(final = result))
+}
+
+graph <- chaining_graph |>
+  lg_add_node("extract", extract_node) |>
+  lg_add_node("expand", expand_node) |>
+  lg_add_node("polish", polish_node) |>
+  lg_add_edge("extract", "expand") |>
+  lg_add_edge("expand", "polish") |>
+  lg_compile()
+
+result <- graph$invoke("R is a programming language for statistics. It was created in 1993. It has strong visualization capabilities.")
+result$state$final
+```
+
+**When to use prompt chaining:**
+- Multi-step text transformation (draft → review → edit)
+- Structured generation (question → outline → full document)
+- Pipeline processing (classify → format → translate)
+
+---
+
+## 3. Routing (Classification)
+
+Classify the input and route it to a specialist node. Each specialist handles one category.
+
+```r
+router_graph <- lg_graph("router",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    category = list(type = "str", reducer = "overwrite"),
+    response = list(type = "str", reducer = "overwrite")
+  ))
+
+# Classifier node: LLM decides the category
+classifier_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Classify the user query into exactly one category.",
+      "Respond with ONLY the category name, nothing else.",
+      "Categories: billing, technical, general"
+    )),
+    list(role = "user", content = state$input)
+  ), temperature = 0)
+
+  category <- trimws(tolower(result))
+
+  # Route based on classification
+  goto <- switch(category,
+    "billing" = "billing_agent",
+    "technical" = "tech_agent",
+    "general" = "general_agent"
+  )
+
+  list(updates = list(category = category), goto = goto %||% "general_agent")
+}
+
+# Specialist: billing
+billing_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a billing specialist. Help with invoices, payments, and subscriptions.",
+      "Always ask for the account email before taking action."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  list(updates = list(response = result))
+}
+
+# Specialist: technical
+tech_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a technical support agent. Help with bugs, setup, and configuration.",
+      "Provide step-by-step instructions when possible."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  list(updates = list(response = result))
+}
+
+# Specialist: general
+general_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = "You are a helpful general assistant."),
+    list(role = "user", content = state$input)
+  ))
+
+  list(updates = list(response = result))
+}
+
+graph <- router_graph |>
+  lg_add_node("classify", classifier_node) |>
+  lg_add_node("billing_agent", billing_node) |>
+  lg_add_node("tech_agent", tech_node) |>
+  lg_add_node("general_agent", general_node) |>
+  lg_compile()
+
+# Test it
+r1 <- graph$invoke("I was charged twice for my subscription")$state$response
+r2 <- graph$invoke("How do I install R on Windows?")$state$response
+r3 <- graph$invoke("What is the capital of France?")$state$response
+```
+
+**Variation: Rule-based routing**
+
+You do not need an LLM for classification — use R logic when the categories are deterministic:
+
+```r
+rule_classifier <- function(state) {
+  text <- tolower(state$input)
+
+  category <- if (grepl("invoice|charge|payment|refund|subscription", text)) {
+    "billing"
+  } else if (grepl("install|error|bug|crash|setup|config", text)) {
+    "technical"
+  } else {
+    "general"
+  }
+
+  list(
+    updates = list(category = category),
+    goto = switch(category,
+      "billing" = "billing_agent",
+      "technical" = "tech_agent",
+      "general_agent"
+    )
+  )
+}
+```
+
+---
+
+## 4. Orchestrator-Worker
+
+An orchestrator LLM breaks down the task into subtasks, assigns them to worker nodes, and aggregates the results.
+
+```r
+orchestrator_graph <- lg_graph("orchestrator_worker",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    subtasks = list(type = "list", reducer = "overwrite"),
+    results = list(type = "list", reducer = "append"),
+    final_report = list(type = "str", reducer = "overwrite")
+  ))
+
+# Orchestrator: decompose the task
+plan_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a task orchestrator. Break down the user's request into 2-3 subtasks.",
+      "Return each subtask on a new line, prefixed with 'TASK: '.",
+      "Do not execute the tasks, just plan them."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  # Parse subtasks from the LLM output
+  subtasks <- strsplit(result, "\n")[[1]]
+  subtasks <- trimws(subtasks)
+  subtasks <- sub("^TASK:\\s*", "", subtasks)
+  subtasks <- subtasks[nchar(subtasks) > 0]
+
+  list(
+    updates = list(subtasks = subtasks),
+    goto = "execute"
+  )
+}
+
+# Worker: execute one subtask at a time
+execute_node <- function(state) {
+  subtasks <- state$subtasks
+  results_done <- if (is.null(state$results)) list() else state$results
+
+  # Find the next unprocessed subtask
+  next_idx <- length(results_done) + 1
+
+  if (next_idx > length(subtasks)) {
+    # All subtasks done, go to aggregator
+    return(list(goto = "aggregate"))
+  }
+
+  current_task <- subtasks[next_idx]
+
+  # Execute this subtask
+  result <- lg_call_model(list(
+    list(role = "system", content = "You are a task executor. Complete the assigned task concisely."),
+    list(role = "user", content = current_task)
+  ))
+
+  list(
+    updates = list(results = list(task = current_task, output = result)),
+    goto = "execute"  # loop back for next subtask
+  )
+}
+
+# Aggregator: combine all results into a final report
+aggregate_node <- function(state) {
+  results <- state$results
+
+  summary_parts <- sapply(results, function(r) {
+    paste0("Task: ", r$task, "\nResult: ", r$output)
+  })
+
+  final <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a report synthesizer. Combine the subtask results into a coherent final report."
+    )),
+    list(role = "user", content = paste(summary_parts, collapse = "\n\n"))
+  ))
+
+  list(updates = list(final_report = final))
+}
+
+graph <- orchestrator_graph |>
+  lg_add_node("plan", plan_node) |>
+  lg_add_node("execute", execute_node) |>
+  lg_add_node("aggregate", aggregate_node) |>
+  lg_add_edge("plan", "execute") |>
+  lg_add_edge("execute", "execute") |>  # self-loop for sequential execution
+  lg_compile()
+
+result <- graph$invoke("Research the R vs Python debate for data science and write a summary")
+result$state$final_report
+```
+
+---
+
+## 5. Evaluator-Optimizer (Reflection)
+
+Generate an output, have a critic evaluate it, and refine until it meets a quality bar.
+
+```r
+reflection_graph <- lg_graph("reflection",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    draft = list(type = "str", reducer = "overwrite"),
+    critique = list(type = "str", reducer = "overwrite"),
+    score = list(type = "number", reducer = "overwrite"),
+    iteration = list(type = "number", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite")
+  ))
+
+# Generator: produce or revise a draft
+generate_node <- function(state) {
+  iter <- if (is.null(state$iteration)) 0 else state$iteration
+
+  sys_prompt <- if (iter == 0) {
+    "You are a writer. Write a clear, concise response to the user's request."
+  } else {
+    paste("You are a writer. Improve this draft based on the critique.",
+          "Address every point the critic raised.")
+  }
+
+  user_prompt <- if (iter == 0) {
+    state$input
+  } else {
+    paste0("Original request: ", state$input,
+           "\n\nCurrent draft: ", state$draft,
+           "\n\nCritique: ", state$critique,
+           "\n\nRewrite the draft to address the critique.")
+  }
+
+  draft <- lg_call_model(list(
+    list(role = "system", content = sys_prompt),
+    list(role = "user", content = user_prompt)
+  ))
+
+  list(
+    updates = list(draft = draft, iteration = iter + 1),
+    goto = "evaluate"
+  )
+}
+
+# Evaluator: critique the draft and give a score
+evaluate_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a writing critic. Evaluate the draft on a scale of 1-10.",
+      "First give specific critique points (one per line).",
+      "Then on the last line, write 'SCORE: N' where N is the score."
+    )),
+    list(role = "user", content = paste0(
+      "Request: ", state$input, "\n\nDraft: ", state$draft
+    ))
+  ), temperature = 0.2)
+
+  # Extract score
+  score <- as.numeric(sub(".*SCORE:\\s*(\\d+).*", "\\1", result, ignore.case = TRUE))
+  if (is.na(score)) score <- 5
+
+  # Extract critique (remove the score line)
+  critique <- sub("SCORE:\\s*\\d+.*", "", result)
+  critique <- trimws(critique)
+
+  list(
+    updates = list(critique = critique, score = score),
+    goto = if (score >= 8 || state$iteration >= 3) "finish" else "generate"
+  )
+}
+
+# Finish: return the final draft
+finish_node <- function(state) {
+  list(updates = list(final = state$draft))
+}
+
+graph <- reflection_graph |>
+  lg_add_node("generate", generate_node) |>
+  lg_add_node("evaluate", evaluate_node) |>
+  lg_add_node("finish", finish_node) |>
+  lg_add_edge("generate", "evaluate") |>
+  lg_add_edge("evaluate", "generate") |>
+  lg_compile()
+
+result <- graph$invoke("Write a 3-sentence product description for a smart water bottle that tracks hydration.")
+result$state$final
+result$state$score
+result$state$iteration
+```
+
+**Variation: Self-critique without a separate evaluator**
+
+A single LLM can critique its own work:
+
+```r
+self_improve_node <- function(state) {
+  draft <- state$draft
+
+  improved <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Review your own response. Identify weaknesses, then rewrite it better.",
+      "Return ONLY the improved version, no commentary."
+    )),
+    list(role = "user", content = paste0("Original request: ", state$input,
+                                        "\n\nDraft: ", draft))
+  ))
+
+  list(updates = list(draft = improved, final = improved))
+}
+```
+
+---
+
+## 6. Plan-and-Execute
+
+The LLM first creates a structured plan (list of steps), then executes each step sequentially, and finally synthesizes a result.
+
+```r
+plan_execute_graph <- lg_graph("plan_execute",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    plan = list(type = "list", reducer = "overwrite"),
+    step_index = list(type = "number", reducer = "overwrite"),
+    step_results = list(type = "list", reducer = "append"),
+    final_answer = list(type = "str", reducer = "overwrite")
+  ))
+
+# Planning phase
+planner_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a planner. Create a step-by-step plan to answer the user's question.",
+      "Return each step on a new line, prefixed with 'STEP: '.",
+      "Keep steps small and specific. 2-5 steps maximum."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  steps <- strsplit(result, "\n")[[1]]
+  steps <- trimws(steps)
+  steps <- sub("^STEP:\\s*", "", steps)
+  steps <- steps[nchar(steps) > 0]
+
+  list(
+    updates = list(plan = steps, step_index = 0),
+    goto = "executor"
+  )
+}
+
+# Execution phase: one step at a time
+executor_node <- function(state) {
+  idx <- state$step_index + 1
+
+  if (idx > length(state$plan)) {
+    return(list(goto = "synthesizer"))
+  }
+
+  current_step <- state$plan[idx]
+
+  # Give the executor context from previous steps
+  prev_context <- ""
+  if (length(state$step_results) > 0) {
+    prev_context <- paste(sapply(seq_along(state$step_results), function(i) {
+      paste0("Step ", i, " result: ", state$step_results[[i]])
+    }), collapse = "\n")
+  }
+
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a step executor. Complete this single step concisely.",
+      if (nchar(prev_context) > 0) paste("Previous results:\n", prev_context)
+    )),
+    list(role = "user", content = current_step)
+  ))
+
+  list(
+    updates = list(
+      step_results = result,
+      step_index = idx
+    ),
+    goto = "executor"  # loop for next step
+  )
+}
+
+# Synthesis phase: combine all step results
+synthesizer_node <- function(state) {
+  context <- paste(sapply(seq_along(state$step_results), function(i) {
+    paste0("Step ", i, ": ", state$plan[i], "\nResult: ", state$step_results[[i]])
+  }), collapse = "\n\n")
+
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a synthesizer. Combine the step results into a final answer",
+      "for the user's original question. Be concise."
+    )),
+    list(role = "user", content = paste0("Original question: ", state$input,
+                                         "\n\nStep results:\n", context))
+  ))
+
+  list(updates = list(final_answer = answer))
+}
+
+graph <- plan_execute_graph |>
+  lg_add_node("planner", planner_node) |>
+  lg_add_node("executor", executor_node) |>
+  lg_add_node("synthesizer", synthesizer_node) |>
+  lg_add_edge("planner", "executor") |>
+  lg_add_edge("executor", "executor") |>
+  lg_compile()
+
+result <- graph$invoke("What are the top 3 R packages for data visualization and how do they compare?")
+result$state$final_answer
+```
+
+---
+
+## Combining Patterns
+
+Real systems combine multiple patterns. For example, a customer support bot might use:
+
+1. **Routing** to classify the intent (billing vs technical vs general)
+2. **ReAct** within each specialist to use tools (look up account, check status)
+3. **Reflection** to ensure the response is helpful before sending
+
+```r
+# Routing → ReAct → Reflection
+combined_graph <- lg_graph("support_bot",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    intent = list(type = "str", reducer = "overwrite"),
+    draft_response = list(type = "str", reducer = "overwrite"),
+    quality_score = list(type = "number", reducer = "overwrite"),
+    final_response = list(type = "str", reducer = "overwrite")
+  ))
+
+# Route by intent
+route_node <- function(state) {
+  intent <- lg_call_model(list(
+    list(role = "system", content = "Classify intent as: billing, technical, general. Reply with one word only."),
+    list(role = "user", content = state$input)
+  ), temperature = 0)
+
+  list(
+    updates = list(intent = trimws(tolower(intent))),
+    goto = paste0(trimws(tolower(intent)), "_handler")
+  )
+}
+
+# Each handler uses lg_call_model (could also use lg_connect() with tools)
+billing_handler <- function(state) {
+  response <- lg_call_model(list(
+    list(role = "system", content = "You are a billing specialist. Be concise and helpful."),
+    list(role = "user", content = state$input)
+  ))
+  list(updates = list(draft_response = response), goto = "quality_check")
+}
+
+# Quality gate
+quality_check_node <- function(state) {
+  score_result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Rate this customer support response 1-10.",
+      "Reply with just the number."
+    )),
+    list(role = "user", content = paste0("Customer: ", state$input,
+                                         "\nResponse: ", state$draft_response))
+  ), temperature = 0)
+
+  score <- as.numeric(trimws(score_result))
+
+  list(
+    updates = list(quality_score = score),
+    goto = if (score >= 7) "finish" else "regenerate"
+  )
+}
+
+# Regenerate if quality is low
+regenerate_node <- function(state) {
+  improved <- lg_call_model(list(
+    list(role = "system", content = "Improve this customer support response. Be more helpful and specific."),
+    list(role = "user", content = paste0("Customer: ", state$input,
+                                         "\nPrevious response: ", state$draft_response))
+  ))
+
+  list(updates = list(draft_response = improved), goto = "quality_check")
+}
+
+finish_node <- function(state) {
+  list(updates = list(final_response = state$draft_response))
+}
+
+graph <- combined_graph |>
+  lg_add_node("route", route_node) |>
+  lg_add_node("billing_handler", billing_handler) |>
+  lg_add_node("quality_check", quality_check_node) |>
+  lg_add_node("regenerate", regenerate_node) |>
+  lg_add_node("finish", finish_node) |>
+  lg_add_edge("quality_check", "regenerate") |>
+  lg_compile()
+```
+
+---
+
+## See Also
+
+- [Multi-Agent Systems](multi-agent-systems.html) — supervisor, network, and hierarchical patterns
+- [RAG Patterns](rag-patterns.html) — retrieval-augmented generation variants
+- [Advanced Recipes](advanced-recipes.html) — complete AI applications
+- [Graph Authoring](graph-authoring.html) — the graph DSL in detail

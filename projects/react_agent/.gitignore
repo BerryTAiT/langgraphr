@@ -1,0 +1,7 @@
+# Secrets never enter version control.
+.env
+
+# Runtime artifacts.
+uploads/
+*.sqlite
+*.sqlite-*

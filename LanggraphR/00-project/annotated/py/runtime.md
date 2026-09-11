@@ -27,6 +27,8 @@ from __future__ import annotations
 import operator
 # 'os' reads model/checkpoint configuration from environment variables.
 import os
+# 'sqlite3' backs the optional durable SqliteSaver checkpointer.
+import sqlite3
 # Typing helpers for dynamically-built state schemas.
 from typing import Annotated, Any, Optional, TypedDict
 
@@ -93,6 +95,18 @@ def _build_llm():
     # Add the api key only when one was configured.
     if api_key:
         kwargs["api_key"] = api_key
+    # Bound the model call so a blackholed API route fails fast instead
+    # of hanging the run: short connect timeout (lets the R client's
+    # proxy/relay rescue engage), generous read time for generation.
+    # Override via LANGGRAPHR_MODEL_TIMEOUT / LANGGRAPHR_CONNECT_TIMEOUT.
+    try:
+        import httpx  # openai dependency, always present
+        kwargs["timeout"] = httpx.Timeout(
+            float(os.getenv("LANGGRAPHR_MODEL_TIMEOUT", "120")),
+            connect=float(os.getenv("LANGGRAPHR_CONNECT_TIMEOUT", "10")),
+        )
+    except Exception:
+        kwargs["timeout"] = float(os.getenv("LANGGRAPHR_MODEL_TIMEOUT", "120"))
     # Construct and return the model object.
     return ChatOpenAI(**kwargs)
 
@@ -124,8 +138,14 @@ def _make_checkpointer(graph_key: str):
         # Attempt to import the sqlite saver (optional dependency).
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
-            # Build a saver connected to the requested database file.
-            saver = SqliteSaver.from_conn_string(db_path)
+            # Open a durable sqlite connection kept alive for the whole
+            # server lifetime. check_same_thread=False is required because
+            # requests arrive on different server threads.
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            # Build the saver directly from the connection. Newer versions
+            # of SqliteSaver.from_conn_string() return a context manager
+            # that would close the connection, so construct it directly.
+            saver = SqliteSaver(conn)
         except Exception as exc:  # noqa: BLE001 - optional dep missing etc.
             # Print a warning to the server log and fall back to memory.
             print(f"[langgraphr] sqlite unavailable ({exc}); using memory")
@@ -329,15 +349,16 @@ def _build_graph_from_spec(spec: dict):
         g.add_node(node["id"], make_node(node["id"], default_to))
     # The graph always starts at the entry node.
     g.add_edge(START, entry)
-    # Add static default edges for completeness and readability.
-    for node in spec["nodes"]:
-        # Read this node's default target.
-        to = defaults.get(node["id"])
-        # Wire to the target node, or to the end when there is none.
-        if to and to != END_MARKER:
-            g.add_edge(node["id"], to)
-        else:
-            g.add_edge(node["id"], END)
+    # NOTE: no static per-node edges. Every node wrapper ALWAYS returns a
+    # Command(goto=...), so routing is fully Command-driven. With LangGraph
+    # 1.x, adding a static edge from a node that also returns Command(goto)
+    # makes the graph fan out to BOTH targets whenever the R node's goto
+    # disagrees with its declared default edge (e.g. a self-cycle like
+    # dispatch -> dispatch while defaults say dispatch -> gate). That
+    # produces multiple simultaneous node interrupts, which the R client
+    # cannot service (it would need interrupt ids on resume). Keeping the
+    # graph edge-free besides START guarantees exactly one pending
+    # interrupt per stop.
     # Compile with the per-graph checkpointer.
     return g.compile(checkpointer=_make_checkpointer(graph_id))
 

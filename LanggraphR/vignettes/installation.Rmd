@@ -1,0 +1,200 @@
+---
+title: "Prerequisites & Installation"
+description: "What you need installed to use langgraphr, and how to install it step by step."
+vignette: >
+  %\VignetteIndexEntry{Prerequisites & Installation}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Prerequisites & Installation
+
+## Prerequisites
+
+### R
+
+R >= 4.1. You can check your version with:
+
+```r
+R.version.string
+```
+
+### Python
+
+Python >= 3.10. The setup script can also use `uv` (recommended) to manage the Python environment automatically.
+
+Check if Python is available:
+
+```r
+Sys.which("python")
+Sys.which("uv")
+```
+
+If either returns a path, you are good to go.
+
+---
+
+## Install langgraphr
+
+### Step 1: Install the R package
+
+From the repository root, run:
+
+```r
+remotes::install_local("LanggraphR")
+```
+
+The `LanggraphR` folder must contain the `DESCRIPTION` file. If you are not in the repo root, use the full path:
+
+```r
+remotes::install_local("C:/path/to/LanggraphR")
+```
+
+This installs the R packages that langgraphr depends on (from `DESCRIPTION`):
+
+- **R6** — OOP classes for agents and graphs
+- **cli** — pretty terminal output and errors
+- **httr2** — HTTP client for talking to the hidden server
+- **jsonlite** — JSON serialization
+- **processx** — spawn and manage the background server process
+
+### Step 2: Install the Python server dependencies
+
+The hidden LangGraph server needs Python packages. They install into `LanggraphR/inst/server/.venv/`.
+
+**Option A — With `uv` (recommended):**
+
+If you have `uv` installed, it creates the venv and resolves dependencies automatically. You do not need to run anything — the server sets itself up on first start.
+
+**Option B — Run the setup script:**
+
+From the repository root (PowerShell):
+
+```powershell
+LanggraphR/scripts/setup_server.ps1
+```
+
+The script:
+1. Creates a virtual environment at `inst/server/.venv/`
+2. Installs all Python dependencies
+
+The Python packages installed (from `inst/server/requirements.txt`):
+
+- **fastapi** — the HTTP server framework
+- **uvicorn** — the ASGI server that runs FastAPI
+- **langgraph** — the agent graph engine
+- **langchain-core** — core abstractions (messages, tools)
+- **langchain-openai** — OpenAI-compatible chat model integration
+- **langgraph-checkpoint-sqlite** — durable memory via SQLite
+
+### Step 3: Verify
+
+```r
+library(langgraphr)
+
+# Start the server and check it is healthy
+lg_start_server()
+```
+
+You should see:
+```
+langgraphr server ready on :8123
+```
+
+---
+
+## Model Configuration
+
+To use LLM features (assistant path, `lg_call_model()`), set your model credentials.
+
+### Environment variables
+
+```r
+Sys.setenv(
+  LANGGRAPHR_API_KEY  = "your-api-key",
+  LANGGRAPHR_MODEL    = "deepseek-chat",
+  LANGGRAPHR_BASE_URL = "https://api.deepseek.com"
+)
+```
+
+Or put them in a `.Renviron` file in your project root:
+
+```
+LANGGRAPHR_API_KEY=your-api-key
+LANGGRAPHR_MODEL=deepseek-chat
+LANGGRAPHR_BASE_URL=https://api.deepseek.com
+```
+
+### Supported providers
+
+Any OpenAI-compatible API works:
+
+| Provider | Base URL | Example model |
+|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+| Ollama (local) | `http://localhost:11434/v1` | `llama3.2` |
+| vLLM | (your endpoint) | (your model) |
+
+### Pure-R graphs need no model
+
+The graph authoring path (`lg_graph()`, `lg_add_node()`, etc.) runs as a pure state machine — no API key required. You can build workflows, pipelines, and stateful logic entirely in R.
+
+Run the first demo to verify:
+
+```r
+lg_tour(1)
+```
+
+---
+
+## Customization
+
+### Custom Python path
+
+By default, langgraphr looks for Python in this order:
+
+1. `options("langgraphr.python")` — explicit R option
+2. `LANGGRAPHR_PYTHON` environment variable
+3. The bundled venv (`inst/server/.venv/`)
+4. `uv` command
+5. `python3` / `python` on PATH
+
+To use a specific Python:
+
+```r
+options(langgraphr.python = "path/to/python.exe")
+```
+
+### Custom port
+
+The server listens on port 8123 by default. Change it with:
+
+```r
+options(langgraphr.port = 9000)
+```
+
+Set this before calling `lg_connect()` or `lg_start_server()`.
+
+### Debug mode
+
+To see server logs in the R console:
+
+```r
+options(langgraphr.debug = TRUE)
+```
+
+Or write logs to a file:
+
+```r
+lg_start_server(logfile = "langgraphr-server.log")
+```
+
+---
+
+## Next Steps
+
+- Follow the [Quick Start](quickstart.html) guide
+- Try the interactive tour: `lg_tour()`
+- Read about [Assistant Agents](assistant-agents.html) or [Graph Authoring](graph-authoring.html)
+- Check the [FAQ](faq.html) if you run into issues

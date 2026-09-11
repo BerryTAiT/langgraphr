@@ -1,0 +1,7 @@
+# Secrets and local databases never enter version control.
+.env
+*.sqlite
+*.sqlite-*
+
+/.quarto/
+**/*.quarto_ipynb

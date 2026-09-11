@@ -1,118 +1,173 @@
 # langgraphr
 
-**Agentic AI for R, powered by LangGraph.** Build AI agents whose "hands"
-are R: the LLM decides what to do, and your R functions, data frames,
-models and plots do the work. The LangGraph engine runs invisibly as a
-local background server — you never write Python.
+> Agentic AI for R, powered by LangGraph.
 
-## Features
+Build AI agents whose "hands" are R. The LLM decides what to do, and your R functions, data frames, models and plots do the work — all in pure R, no Python code required.
 
-- **Assistant agents with R tools** — register any R function as a tool
-  the LLM can call (`lg_connect()` + `agent$add_tool()`).
-- **Custom stateful graphs in pure R** — author multi-step agent
-  workflows with `lg_graph() |> lg_add_node() |> lg_compile()`; node
-  bodies are R, orchestration is real LangGraph (loops, branching,
-  reducers).
-- **Multi-agent systems** — graphs calling graphs, no model or API key
-  needed for the pure-graph path.
-- **Thread memory** — conversations persist per thread; optional SQLite
-  durability with `lg_use_sqlite()`.
-- **Any OpenAI-compatible model** — OpenAI, DeepSeek, Ollama, vLLM and
-  more via environment variables.
-- **Zero-config networking** — automatic VPN/proxy-resilient model
-  connectivity: the package detects your system proxy, retries alternate
-  routes, and (as a last resort) relays model traffic through R's own
-  HTTP stack. It works whether your VPN is on or off, on Windows, macOS
-  and Linux, with no VPN configuration needed.
+---
 
-## Installation
+## Two Ways to Build
 
-```r
-# 1. Install the package
-remotes::install_local("langgraphr")
+### Assistant Path — Quick Start
 
-# 2. One-time: install the hidden server's Python dependencies
-#    (only needed if `uv` is not installed; uv creates the environment
-#    on demand automatically)
-scripts/setup_server.ps1   # Windows
-```
-
-Requirements: R >= 4.1 and Python >= 3.10 (or [uv](https://docs.astral.sh/uv/)).
-
-## Configure a model
-
-Set environment variables (e.g. in `.Renviron`, or a `.env` file with
-`dotenv::load_dot_env()`):
-
-```
-LANGGRAPHR_MODEL=deepseek-v4-flash
-LANGGRAPHR_API_KEY=sk-...
-LANGGRAPHR_BASE_URL=https://api.deepseek.com
-```
-
-`LANGGRAPHR_BASE_URL` is optional (defaults to OpenAI). Never commit
-API keys — keep them in `.env` or `.Renviron`.
-
-## Quickstart: an assistant with R tools
+Register R functions as tools and chat with an LLM agent. The agent decides when to call your tools.
 
 ```r
 library(langgraphr)
 
 agent <- lg_connect()
 
-top_products <- function(products, n = 3) {
-  head(products[order(products$revenue, decreasing = TRUE), , drop = FALSE], n)
+top_products <- function(data, n = 3) {
+  head(data[order(data$revenue, decreasing = TRUE), ], n)
 }
-agent$add_tool(top_products, description = "Return the top-N products by revenue")
 
-res <- agent$invoke("Here is today's sales data: ... which products are top?")
-cat(res$content)
+agent$add_tool(top_products,
+  description = "Return the top-N products by revenue from a data frame")
+
+result <- agent$invoke("What are the top 2 products by revenue?")
+result$content
 ```
 
-See `examples/quickstart.R` (assistant path) and
-`examples/multi_agent.R` (graph path, needs **no** model or API key).
+### Graph Authoring Path — Full Control
 
-## Quickstart: a custom graph in pure R
+Build custom stateful graphs where every node is an R function. No LLM needed — this is a pure state machine.
 
 ```r
-countdown <- lg_graph("countdown",
+g <- lg_graph("countdown",
   state = list(count = list(type = "number", reducer = "overwrite")))
 
-count_step <- function(state) {
-  n <- state$count %||% as.numeric(state$input)
-  if (n - 1 > 0) list(updates = list(count = n - 1), goto = "step") else
-                  list(updates = list(count = n - 1))
+step <- function(state) {
+  n <- state$count
+  if (is.null(n)) n <- as.numeric(state$input)
+  if (n - 1 > 0) list(updates = list(count = n - 1), goto = "step")
+  else            list(updates = list(count = 0))
 }
 
-countdown |>
-  lg_add_node("step", count_step) |>
-  lg_compile() |>
-  (\(g) g$invoke("3"))()
+graph <- g |> lg_add_node("step", step) |> lg_compile()
+graph$invoke("5")$state$count
+# 0
 ```
 
-## How it works
+---
 
-R is the developer surface; a hidden FastAPI sidecar runs the real
-LangGraph engine on 127.0.0.1. When Python needs R code (a tool call or
-a graph node), the run *pauses* via LangGraph's `interrupt()`, R executes
-the function locally, and the run resumes over HTTP. Your R code and data
-never leave your machine.
+## Features
 
-```
-R session                          hidden Python sidecar
------------                        ----------------------
-lg_connect()  ──────spawn──────▶  uvicorn (port 8123)
-agent$invoke() ────HTTP──────▶   LangGraph engine
-   ▲                                │
-   └──── interrupt: run this  ◀─────┘
-         R function, then resume
-```
+- **Real LangGraph engine** — production-grade graph runtime, not a reimplementation
+- **Pure R API** — you never write or see Python code
+- **Your data stays in R** — tool arguments cross the wire, but your data frames, models, and environments stay in R memory
+- **Conversation memory** — thread-based persistence with optional SQLite durability
+- **Any OpenAI-compatible model** — OpenAI, DeepSeek, Ollama, vLLM, and more
+- **Network resilient** — auto-detects system proxies, retries on alternate routes, falls back to an in-R relay when VPNs break Python's TLS
+- **Two paths in one package** — quick assistant agents and full graph authoring
+- **Shiny-compatible** — build interactive chat UIs with Shiny (see example projects)
 
-## Development
+---
+
+## Installation
 
 ```r
-testthat::test_local("langgraphr")   # full suite, no API key needed
-roxygen2::roxygenise("langgraphr")   # regenerate docs
+# Install the R package
+remotes::install_local("LanggraphR")
 ```
 
-MIT License.
+Then set up the Python server (run once from the repo root):
+
+```powershell
+LanggraphR/scripts/setup_server.ps1
+```
+
+See the [full installation guide](articles/installation.html) for details.
+
+---
+
+## Quick Example
+
+```r
+library(langgraphr)
+
+# Set your model credentials (or use .Renviron)
+Sys.setenv(LANGGRAPHR_API_KEY = "your-key")
+Sys.setenv(LANGGRAPHR_MODEL = "deepseek-chat")
+Sys.setenv(LANGGRAPHR_BASE_URL = "https://api.deepseek.com")
+
+# Connect — starts the hidden server automatically
+agent <- lg_connect()
+
+# Register an R function as a tool
+fibonacci <- function(n) {
+  if (n <= 1) return(n)
+  fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+agent$add_tool(fibonacci,
+  description = "Compute the nth Fibonacci number")
+
+# Chat
+result <- agent$invoke("What is the 10th Fibonacci number?")
+cat(result$content)
+```
+
+---
+
+## Documentation
+
+- **[Quick Start](articles/quickstart.html)** — get up and running in 5 minutes
+- **[Installation](articles/installation.html)** — prerequisites and setup
+- **[Assistant Agents](articles/assistant-agents.html)** — build LLM agents with R tools
+- **[Graph Authoring](articles/graph-authoring.html)** — custom stateful graphs in pure R
+- **[Memory & Threads](articles/memory-and-threads.html)** — conversation memory and persistence
+- **[Tools & Models](articles/tools-and-models.html)** — tool schemas and direct model calls
+- **[Architecture](articles/architecture.html)** — how it works under the hood
+- **[FAQ & Troubleshooting](articles/faq.html)** — common questions and fixes
+- **[Function Reference](reference/index.html)** — complete API documentation
+
+Run `lg_tour()` for an interactive guided tour:
+
+```r
+library(langgraphr)
+lg_tour()
+```
+
+---
+
+## How It Works
+
+langgraphr runs a hidden FastAPI server in the background that hosts the real LangGraph engine. When LangGraph needs to execute a tool or a graph node, it calls `interrupt()` — pausing the run and handing control back to R. R executes your function locally and resumes the run via HTTP.
+
+```
+R code  ◄────── HTTP (localhost) ──────►  Python sidecar
+  │                                          │
+  └─ Your R functions run here               └─ Real LangGraph engine
+     (tools, nodes, data frames)                LLM calls, graph orchestration
+```
+
+This interrupt-resume pattern is built on LangGraph's native human-in-the-loop feature — R is the "human in the loop."
+
+Learn more in the [Architecture guide](articles/architecture.html).
+
+---
+
+## Requirements
+
+| Component | Minimum version |
+|---|---|
+| R | 4.1 |
+| Python | 3.10 |
+
+**R dependencies:** R6, cli, httr2, jsonlite, processx
+
+**Python dependencies:** fastapi, uvicorn, langgraph, langchain-core, langchain-openai, langgraph-checkpoint-sqlite
+
+---
+
+## Status
+
+Version **0.3.0** — active development.
+
+The core features (assistant path, graph authoring, memory, tool schemas) are working and tested. Some advanced LangGraph features (parallel Send, SSE streaming) are on the roadmap.
+
+---
+
+## License
+
+MIT

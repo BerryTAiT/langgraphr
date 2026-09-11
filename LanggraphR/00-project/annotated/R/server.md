@@ -313,9 +313,46 @@ lg_stop_server <- function() {
       }
     }
   }
+  # Fallback for servers started by ANOTHER R process (the handle is
+  # per-process: a callr worker running the route-switch rescue sees
+  # NULL here). Kill whatever is listening on the port at the OS level,
+  # so replacing the sidecar actually works from any process.
+  pids <- .lg_pids_listening_on(getOption("langgraphr.port", 8123L))
+  for (pid in pids) {
+    if (.Platform$OS.type == "windows") {
+      system2("taskkill", c("/PID", pid, "/T", "/F"),
+              stdout = FALSE, stderr = FALSE)
+    } else {
+      system2("kill", c("-9", pid), stdout = FALSE, stderr = FALSE)
+    }
+  }
   # Clear the stored handle so we do not try to kill it twice.
   .lg_env$proc <- NULL
   # Return nothing useful.
   invisible(NULL)
+}
+
+# .lg_pids_listening_on(port) - PIDs of processes listening on a TCP
+# port, discovered at the OS level (locale-independent).
+.lg_pids_listening_on <- function(port) {
+  # Windows: PowerShell's Get-NetTCPConnection is structured and immune
+  # to localized netstat output.
+  if (.Platform$OS.type == "windows") {
+    out <- tryCatch(
+      system2("powershell", c("-NoProfile", "-Command",
+              paste0("Get-NetTCPConnection -LocalPort ", port,
+                     " -State Listen -ErrorAction SilentlyContinue | ",
+                     "Select-Object -ExpandProperty OwningProcess")),
+              stdout = TRUE, stderr = FALSE),
+      error = function(e) character(0))
+  } else {
+    out <- tryCatch(
+      system2("lsof", c("-t", paste0("-i:", port), "-sTCP:LISTEN"),
+              stdout = TRUE, stderr = FALSE),
+      error = function(e) character(0))
+  }
+  # Keep only well-formed numeric pids (drops headers and blank lines).
+  pids <- trimws(out)
+  unique(pids[grepl("^\\d+$", pids)])
 }
 ```

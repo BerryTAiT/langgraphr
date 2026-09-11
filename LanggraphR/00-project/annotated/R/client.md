@@ -53,6 +53,11 @@
   # below reads the JSON body and raises a readable error that includes
   # the server's detail field (e.g. "Agent run failed: ...").
   req <- httr2::req_error(req, is_error = function(resp) FALSE)
+  # Bound every request so a silently hung sidecar (e.g. its model call
+  # blackholed by a VPN) becomes a recoverable "timed out" error instead
+  # of blocking the caller forever. Overridable via options().
+  req <- httr2::req_timeout(req,
+    seconds = getOption("langgraphr.request_timeout", 120L))
   # If the caller supplied a body, attach it as a JSON request body.
   if (!is.null(body)) {
     # Give empty lists explicit empty names so they serialize as JSON
@@ -105,6 +110,10 @@
 .lg_perform_retrying <- function(port, path, body = NULL, max_retries = 2L) {
   # Attempt counter for the recovery loop.
   tries <- 0L
+  # Whether the one-shot R relay rescue has already been tried; the relay
+  # must never loop, because every pass restarts the sidecar and an
+  # unbounded loop would hang the caller forever.
+  relayed <- FALSE
   repeat {
     # Either the parsed response or the caught error.
     res <- tryCatch(
@@ -123,6 +132,10 @@
       # works even when VPN rules reset Python's connections. Fully
       # automatic - the user never configures anything.
       if (is_conn) {
+        # One-shot rescue: if even the R relay cannot reach the model,
+        # surface the real error instead of restarting the sidecar in
+        # an endless loop (each retry boots a fresh sidecar).
+        if (relayed) stop(res$err)
         base <- Sys.getenv("LANGGRAPHR_BASE_URL", unset = "https://api.openai.com/v1")
         relay_url <- .lg_start_relay(base)
         cli::cli_alert_warning(paste0(
@@ -134,6 +147,7 @@
           LANGGRAPHR_BASE_URL = relay_url,
           NO_PROXY = "*", no_proxy = "*"
         ))
+        relayed <- TRUE
         next
       }
       stop(res$err)

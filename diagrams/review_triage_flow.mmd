@@ -1,0 +1,9 @@
+flowchart TD
+    A["START<br/>a customer message arrives"] --> B["Task 1: classify (LLM)<br/>what is it about + urgency 1-5"]
+    B --> C{"Task 2: route (pure R)<br/>urgency 4 or higher?"}
+    C -->|"yes: angry customer"| D["Task 3: draft_urgent (LLM)<br/>apologetic reply + escalate"]
+    C -->|"no: normal question"| E["Task 4: draft_normal (LLM)<br/>friendly reply"]
+    D --> F{"Task 5: check (LLM)<br/>is the reply good to send?"}
+    E --> F
+    F -->|"no: rewrite (max once)"| D
+    F -->|"yes"| G["END<br/>final state goes back to you"]

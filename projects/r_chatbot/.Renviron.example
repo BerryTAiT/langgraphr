@@ -1,0 +1,15 @@
+# .Renviron.example - example environment variables for other users.
+# Copy the lines you need into a .env file next to main.R (recommended,
+# loaded automatically via dotenv), or into your user ~/.Renviron.
+
+# Which OpenAI-compatible model to chat with.
+LANGGRAPHR_MODEL=deepseek-v4-flash
+
+# Your API key for that provider. Keep this secret; never commit it.
+LANGGRAPHR_API_KEY=sk-your-key-here
+
+# The provider's OpenAI-compatible endpoint.
+LANGGRAPHR_BASE_URL=https://api.deepseek.com
+
+# Optional: SQLite file for durable conversation memory between sessions.
+# LANGGRAPHR_DB=chatbot_memory.sqlite

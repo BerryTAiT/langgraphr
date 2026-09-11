@@ -1,0 +1,264 @@
+---
+title: "Tools & Models"
+description: "Tool schemas, direct model calls, and how R functions become LLM tools."
+vignette: >
+  %\VignetteIndexEntry{Tools & Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Tools & Models
+
+Two of the most common things you will do with langgraphr are registering R functions as LLM tools and calling the model directly from R. This guide covers both in depth.
+
+---
+
+## Tool Schemas
+
+When you register an R function as a tool, langgraphr generates an OpenAI-compatible tool schema. The schema tells the LLM:
+
+- The tool's **name**
+- What the tool **does** (description)
+- What **arguments** it takes (parameters, with types and which are required)
+
+### Automatic schema inference
+
+`lg_tool_schema()` (and `agent$add_tool()`) infer the parameter schema from the function's formal arguments:
+
+```r
+my_function <- function(name, count = 3, verbose = FALSE) {
+  # ...
+}
+
+schema <- lg_tool_schema(my_function,
+  description = "Process items with the given name")
+```
+
+This generates approximately:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "my_function",
+    "description": "Process items with the given name",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name":    { "type": "string", "description": "" },
+        "count":   { "type": "number", "description": "" },
+        "verbose": { "type": "boolean", "description": "" }
+      },
+      "required": ["name"]
+    }
+  }
+}
+```
+
+### Type inference rules
+
+| R default value | JSON schema type | Required? |
+|---|---|---|
+| No default (missing) | `string` | Yes |
+| `TRUE` / `FALSE` | `boolean` | No |
+| Numeric (`42`, `3.14`) | `number` | No |
+| Character string | `string` | No |
+| `Date` / `POSIXt` | `string` | No |
+
+### Providing an explicit schema
+
+For production use, you typically want richer schemas with descriptions and more precise types. Pass a `parameters` list to override the inference:
+
+```r
+agent$add_tool(query_database,
+  name = "query_db",
+  description = "Run a SQL query against the sales database and return results",
+  parameters = list(
+    type = "object",
+    properties = list(
+      query = list(
+        type = "string",
+        description = "A valid SQL SELECT query"
+      ),
+      max_rows = list(
+        type = "number",
+        description = "Maximum number of rows to return (default 100)"
+      )
+    ),
+    required = c("query")
+  ))
+```
+
+### Tool name sanitization
+
+Tool names must match `^[a-zA-Z0-9_-]+$` (letters, digits, underscores, hyphens). langgraphr automatically sanitizes names that do not match, replacing invalid characters with underscores.
+
+---
+
+## How Tool Calls Work
+
+When the LLM decides to call a tool, here is the full flow:
+
+1. The LLM produces a `tool_calls` array in its response
+2. LangGraph routes to the `tools` node
+3. The tools node identifies which tools are R-only (not Python-local)
+4. For R tools, it calls `interrupt()` with the tool call requests
+5. The HTTP response returns to R with `status: "interrupted"`
+6. R executes each requested tool function locally
+7. R POSTs the results back to `/resume`
+8. LangGraph resumes, results are fed back to the LLM as `ToolMessage`s
+9. The loop continues until the LLM produces a final answer
+
+### Argument coercion
+
+JSON arguments from the model are automatically converted to natural R types:
+
+| JSON value | R type |
+|---|---|
+| Array of scalars `[1, 2, 3]` | Atomic vector `c(1, 2, 3)` |
+| Array of objects `[{a:1}, {a:2}]` | Data frame |
+| Object `{key: "value"}` | Named list |
+| String `"1, 2, 3"` | Numeric vector `c(1, 2, 3)` (if all tokens are numeric) |
+| String `"[1, 2, 3]"` | Parsed as JSON array |
+
+The string-to-vector conversion is a convenience feature: models often send comma-separated numbers in string arguments when the schema type is inferred as "string".
+
+### Result preparation
+
+Return values from your R functions are made JSON-safe:
+
+- **Data frames** become arrays of row objects (one object per row)
+- **Lists** are converted recursively
+- **Atomic values** pass through unchanged
+
+You can return anything from a tool function — data frames, lists, vectors, single values.
+
+### Tool errors
+
+If your function throws an error, the error message is sent back to the model as the tool result. The model can then try again with corrected arguments. This is the standard ReAct pattern: observe the error, think, try again.
+
+---
+
+## Direct Model Calls
+
+Use `lg_call_model()` to call an OpenAI-compatible chat model directly from R, without going through the agent or graph system. This is useful inside graph nodes, for one-off generation, or for building custom workflows.
+
+### Basic usage
+
+```r
+result <- lg_call_model(list(
+  list(role = "system", content = "You are a helpful assistant."),
+  list(role = "user", content = "What is the capital of France?")
+))
+
+result
+# "The capital of France is Paris."
+```
+
+### With model configuration
+
+```r
+result <- lg_call_model(
+  messages = list(
+    list(role = "user", content = "Write a haiku about data.")
+  ),
+  model = "deepseek-chat",
+  base_url = "https://api.deepseek.com",
+  api_key = "your-key",
+  temperature = 0.7,
+  max_tokens = 200
+)
+```
+
+### Model configuration from environment variables
+
+When you do not pass `model`, `base_url`, or `api_key`, `lg_call_model()` reads them from environment variables:
+
+| Argument | Environment variable | Default |
+|---|---|---|
+| `model` | `LANGGRAPHR_MODEL` | `"gpt-4o-mini"` |
+| `base_url` | `LANGGRAPHR_BASE_URL` | OpenAI endpoint |
+| `api_key` | `LANGGRAPHR_API_KEY` then `OPENAI_API_KEY` | (required) |
+
+This means you can configure the model once at the top of your script and every call uses the same settings:
+
+```r
+Sys.setenv(
+  LANGGRAPHR_MODEL = "deepseek-chat",
+  LANGGRAPHR_BASE_URL = "https://api.deepseek.com",
+  LANGGRAPHR_API_KEY = "your-key"
+)
+
+# All subsequent calls use these settings
+lg_call_model(list(list(role = "user", content = "Hello")))
+```
+
+### Inside a graph node
+
+`lg_call_model()` is commonly used inside graph nodes:
+
+```r
+summarize_node <- function(state) {
+  text <- state$data
+
+  summary <- lg_call_model(list(
+    list(role = "system",
+         content = "Summarize the following text in 3 bullet points."),
+    list(role = "user", content = text)
+  ), temperature = 0.3, max_tokens = 300)
+
+  list(
+    updates = list(summary = summary),
+    goto = "next_step"
+  )
+}
+```
+
+This runs entirely from R — the model call does not go through the hidden Python server.
+
+### Timeout
+
+The default request timeout is 120 seconds. Override it with the `timeout` parameter:
+
+```r
+lg_call_model(messages, timeout = 300)  # 5 minutes
+```
+
+---
+
+## Tool Schema Reference
+
+### `lg_tool_schema(fn, name, description, parameters)`
+
+Converts an R function into an OpenAI tool-schema list.
+
+**Arguments:**
+- `fn` — the R function
+- `name` — tool name (default: deparsed function name)
+- `description` — what the tool does (guidance for the model)
+- `parameters` — explicit parameters schema (default: inferred from formals)
+
+**Returns:** A list in OpenAI tool-schema format (`type = "function"` with `function$name`, `function$description`, `function$parameters`).
+
+### `lg_call_model(messages, model, base_url, api_key, temperature, max_tokens, timeout)`
+
+Calls an OpenAI-compatible chat model directly from R.
+
+**Arguments:**
+- `messages` — list of message lists, each with `role` and `content`
+- `model` — model name (default: `LANGGRAPHR_MODEL` env var)
+- `base_url` — API base URL (default: `LANGGRAPHR_BASE_URL` env var)
+- `api_key` — API key (default: `LANGGRAPHR_API_KEY` env var)
+- `temperature` — sampling temperature (optional)
+- `max_tokens` — maximum tokens to generate (optional)
+- `timeout` — request timeout in seconds (default 120)
+
+**Returns:** The assistant's reply text (character scalar).
+
+---
+
+## See Also
+
+- [Assistant Agents](assistant-agents.html) — using tools in the agent path
+- [Graph Authoring](graph-authoring.html) — using `lg_call_model()` inside graph nodes
+- [Architecture](architecture.html) — how tool execution works under the hood

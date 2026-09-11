@@ -1,0 +1,6 @@
+Package: legacyops
+Title: Legacy Operations Helpers (intentionally defective demo repo)
+Version: 0.1.0
+Description: Sample legacy R codebase for the AutoPatch modernization demo.
+    Contains known style, correctness, and security defects.
+Encoding: UTF-8

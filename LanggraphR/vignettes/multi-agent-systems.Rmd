@@ -1,0 +1,759 @@
+---
+title: "Multi-Agent Systems"
+description: "Build systems where multiple AI agents collaborate — supervisor, network, and hierarchical patterns in pure R."
+vignette: >
+  %\VignetteIndexEntry{Multi-Agent Systems}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Multi-Agent Systems
+
+When a single agent is not enough, you need multiple agents working together. This guide covers the three canonical multi-agent architectures from LangGraph, implemented in pure R.
+
+---
+
+## Why Multi-Agent?
+
+A single LLM agent has limits:
+- Context window fills up with complex conversations
+- One agent cannot specialize in everything
+- Long tasks produce too many tool calls in a single loop
+
+Multi-agent systems solve this by dividing work among specialized agents that communicate through shared state.
+
+---
+
+## Pattern Overview
+
+| Pattern | Structure | Best for |
+|---|---|---|
+| **Supervisor** | One router agent dispatches to worker agents | Clear task decomposition |
+| **Network** | Agents talk to each other directly | Collaborative, open-ended |
+| **Hierarchical** | Supervisors delegate to sub-supervisors | Large, complex organizations |
+
+---
+
+## 1. Supervisor Pattern
+
+A supervisor agent receives the task, decides which worker agent should handle it, delegates, collects results, and produces the final answer.
+
+```
+         ┌──────────┐
+         │ Supervisor│
+         └────┬─────┘
+     ┌────────┼────────┐
+     ▼        ▼        ▼
+  ┌─────┐ ┌─────┐ ┌─────┐
+  │Worker│ │Worker│ │Worker│
+  │  A   │ │  B   │ │  C   │
+  └─────┘ └─────┘ └─────┘
+```
+
+### Implementation
+
+```r
+library(langgraphr)
+
+supervisor_graph <- lg_graph("supervisor",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    messages = list(type = "list", reducer = "append"),
+    next_agent = list(type = "str", reducer = "overwrite"),
+    research_result = list(type = "str", reducer = "overwrite"),
+    analysis_result = list(type = "str", reducer = "overwrite"),
+    writing_result = list(type = "str", reducer = "overwrite"),
+    final_answer = list(type = "str", reducer = "overwrite")
+  ))
+
+# Supervisor: decide which agent to activate next
+supervisor_node <- function(state) {
+  # Build context from previous agent outputs
+  context <- ""
+  if (!is.null(state$research_result)) context <- paste0(context, "Research done. ")
+  if (!is.null(state$analysis_result)) context <- paste0(context, "Analysis done. ")
+  if (!is.null(state$writing_result))  context <- paste0(context, "Writing done. ")
+
+  # If all work is done, synthesize the final answer
+  if (!is.null(state$research_result) && !is.null(state$analysis_result) && !is.null(state$writing_result)) {
+    synthesis <- lg_call_model(list(
+      list(role = "system", content = "Synthesize the research, analysis, and writing into a final concise answer."),
+      list(role = "user", content = paste0(
+        "Task: ", state$input,
+        "\nResearch: ", state$research_result,
+        "\nAnalysis: ", state$analysis_result,
+        "\nWriting: ", state$writing_result
+      ))
+    ))
+    return(list(updates = list(final_answer = synthesis)))
+  }
+
+  # Decide which agent to call next
+  decision <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a supervisor. Decide which worker should act next.",
+      "Workers: researcher, analyst, writer",
+      "Respond with ONLY the worker name, nothing else.",
+      "Context:", context
+    )),
+    list(role = "user", content = state$input)
+  ), temperature = 0)
+
+  worker <- trimws(tolower(decision))
+
+  list(
+    updates = list(next_agent = worker),
+    goto = switch(worker,
+      "researcher" = "researcher",
+      "analyst" = "analyst",
+      "writer" = "writer",
+      "supervisor"  # fallback: loop back
+    )
+  )
+}
+
+# Worker: Researcher
+researcher_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a research agent. Gather and summarize key facts about the topic.",
+      "Be thorough but concise. Focus on factual information."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  list(
+    updates = list(research_result = result),
+    goto = "supervisor"
+  )
+}
+
+# Worker: Analyst
+analyst_node <- function(state) {
+  research <- state$research_result %||% "No research available yet."
+
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are an analysis agent. Analyze the research findings.",
+      "Identify patterns, draw conclusions, make recommendations."
+    )),
+    list(role = "user", content = paste0(
+      "Task: ", state$input,
+      "\nResearch findings: ", research
+    ))
+  ))
+
+  list(
+    updates = list(analysis_result = result),
+    goto = "supervisor"
+  )
+}
+
+# Worker: Writer
+writer_node <- function(state) {
+  research <- state$research_result %||% ""
+  analysis <- state$analysis_result %||% ""
+
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a writing agent. Write a clear, engaging response",
+      "based on the research and analysis provided."
+    )),
+    list(role = "user", content = paste0(
+      "Task: ", state$input,
+      "\nResearch: ", research,
+      "\nAnalysis: ", analysis
+    ))
+  ))
+
+  list(
+    updates = list(writing_result = result),
+    goto = "supervisor"
+  )
+}
+
+# Compile the graph
+graph <- supervisor_graph |>
+  lg_add_node("supervisor", supervisor_node) |>
+  lg_add_node("researcher", researcher_node) |>
+  lg_add_node("analyst", analyst_node) |>
+  lg_add_node("writer", writer_node) |>
+  lg_compile()
+
+result <- graph$invoke("Explain why R is popular for data science")
+result$state$final_answer
+```
+
+### Supervisor with tool-using workers
+
+Each worker can also be a full ReAct agent with its own tools:
+
+```r
+researcher_with_tools <- function(state) {
+  # Create a dedicated agent with research tools
+  agent <- lg_connect(thread_id = paste0("researcher_", lg_thread_id()))
+
+  web_search <- function(query) {
+    # In production, call a real search API
+    paste("Search results for:", query)
+  }
+
+  agent$add_tool(web_search, description = "Search the web for information")
+
+  result <- agent$invoke(paste0(
+    "Research this topic thoroughly: ", state$input
+  ))
+
+  list(
+    updates = list(research_result = result$content),
+    goto = "supervisor"
+  )
+}
+```
+
+---
+
+## 2. Network Pattern
+
+Agents communicate directly with each other rather than going through a central supervisor. Each agent can decide which other agent to call next.
+
+```
+  ┌─────────┐         ┌─────────┐
+  │ Agent A │────────│ Agent B │
+  └────┬────┘         └────┬────┘
+       │                    │
+       │    ┌─────────┐    │
+       └───│ Agent C │────┘
+            └─────────┘
+```
+
+### Implementation
+
+```r
+network_graph <- lg_graph("network",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    facts = list(type = "list", reducer = "append"),
+    analysis = list(type = "str", reducer = "overwrite"),
+    response = list(type = "str", reducer = "overwrite"),
+    speaker = list(type = "str", reducer = "overwrite"),
+    turn_count = list(type = "number", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite")
+  ))
+
+# A router that decides who speaks next
+next_speaker_node <- function(state) {
+  turns <- state$turn_count %||% 0
+
+  # End after enough turns
+  if (turns >= 4) {
+    synthesis <- lg_call_model(list(
+      list(role = "system", content = "Synthesize the conversation into a final answer."),
+      list(role = "user", content = paste0("Task: ", state$input,
+                                           "\nFacts: ", paste(state$facts, collapse = "; "),
+                                           "\nAnalysis: ", state$analysis))
+    ))
+    return(list(updates = list(final = synthesis)))
+  }
+
+  # Decide who speaks next based on what is missing
+  next_speaker <- if (is.null(state$facts) || length(state$facts) == 0) {
+    "fact_checker"
+  } else if (is.null(state$analysis)) {
+    "analyst"
+  } else {
+    "responder"
+  }
+
+  list(
+    updates = list(speaker = next_speaker, turn_count = turns + 1),
+    goto = next_speaker
+  )
+}
+
+# Agent: Fact Checker
+fact_checker_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a fact-checker. Provide verified facts about the topic.",
+      "State each fact as a single sentence."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  facts <- strsplit(result, "\n")[[1]]
+  facts <- trimws(facts)
+  facts <- facts[nchar(facts) > 0]
+
+  list(
+    updates = list(facts = facts),
+    goto = "next_speaker"
+  )
+}
+
+# Agent: Analyst
+analyst_node <- function(state) {
+  facts <- paste(state$facts, collapse = "\n")
+
+  result <- lg_call_model(list(
+    list(role = "system", content = "Analyze the facts. What do they tell us?"),
+    list(role = "user", content = paste0("Question: ", state$input, "\n\nFacts:\n", facts))
+  ))
+
+  list(
+    updates = list(analysis = result),
+    goto = "next_speaker"
+  )
+}
+
+# Agent: Responder
+responder_node <- function(state) {
+  facts <- paste(state$facts, collapse = "\n")
+  analysis <- state$analysis
+
+  result <- lg_call_model(list(
+    list(role = "system", content = "Write the final response to the user based on facts and analysis."),
+    list(role = "user", content = paste0("Question: ", state$input,
+                                         "\nFacts:\n", facts,
+                                         "\nAnalysis:\n", analysis))
+  ))
+
+  list(
+    updates = list(response = result, final = result),
+    goto = "next_speaker"
+  )
+}
+
+graph <- network_graph |>
+  lg_add_node("next_speaker", next_speaker_node) |>
+  lg_add_node("fact_checker", fact_checker_node) |>
+  lg_add_node("analyst", analyst_node) |>
+  lg_add_node("responder", responder_node) |>
+  lg_compile()
+
+result <- graph$invoke("Is R or Python better for statistical modeling?")
+result$state$final
+```
+
+---
+
+## 3. Hierarchical Pattern
+
+For complex systems, you can nest supervisors. A top-level supervisor delegates to team leads, who each manage their own workers.
+
+```
+            ┌────────────────┐
+            │ Chief Supervisor│
+            └───────┬────────┘
+           ┌────────┼────────┐
+           ▼                 ▼
+    ┌──────────┐     ┌──────────┐
+    │Research   │     │ Writing  │
+    │Team Lead  │     │ Team Lead│
+    └─────┬────┘     └────┬─────┘
+     ┌────┼────┐     ┌────┼────┐
+     ▼    ▼    ▼     ▼    ▼    ▼
+    Web  Data  Lib  Draft Edit Format
+```
+
+### Implementation
+
+```r
+hierarchical_graph <- lg_graph("hierarchical",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    team = list(type = "str", reducer = "overwrite"),
+    web_facts = list(type = "str", reducer = "overwrite"),
+    data_facts = list(type = "str", reducer = "overwrite"),
+    draft = list(type = "str", reducer = "overwrite"),
+    edited = list(type = "str", reducer = "overwrite"),
+    formatted = list(type = "str", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite")
+  ))
+
+# Chief supervisor: delegate to team leads
+chief_node <- function(state) {
+  # Check which teams have finished
+  research_done <- !is.null(state$web_facts) && !is.null(state$data_facts)
+  writing_done <- !is.null(state$draft) && !is.null(state$edited) && !is.null(state$formatted)
+
+  if (research_done && writing_done) {
+    # Both teams done, synthesize
+    final <- lg_call_model(list(
+      list(role = "system", content = "Produce the final deliverable from all team outputs."),
+      list(role = "user", content = paste0(
+        "Task: ", state$input,
+        "\nWeb research: ", state$web_facts,
+        "\nData research: ", state$data_facts,
+        "\nDraft: ", state$draft,
+        "\nEdited: ", state$edited,
+        "\nFormatted: ", state$formatted
+      ))
+    ))
+    return(list(updates = list(final = final)))
+  }
+
+  # Delegate to whichever team has not worked yet
+  team <- if (!research_done) "research_team" else "writing_team"
+
+  list(updates = list(team = team), goto = team)
+}
+
+# Research team lead
+research_team_node <- function(state) {
+  # Sub-supervisor: delegate within the research team
+  if (is.null(state$web_facts)) {
+    return(list(goto = "web_researcher"))
+  }
+  if (is.null(state$data_facts)) {
+    return(list(goto = "data_researcher"))
+  }
+  # Both researchers done, return to chief
+  list(goto = "chief")
+}
+
+web_researcher_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = "You are a web researcher. Summarize key findings from web sources."),
+    list(role = "user", content = state$input)
+  ))
+  list(updates = list(web_facts = result), goto = "research_team")
+}
+
+data_researcher_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = "You are a data analyst. Describe what the data shows."),
+    list(role = "user", content = state$input)
+  ))
+  list(updates = list(data_facts = result), goto = "research_team")
+}
+
+# Writing team lead
+writing_team_node <- function(state) {
+  if (is.null(state$draft)) {
+    return(list(goto = "drafter"))
+  }
+  if (is.null(state$edited)) {
+    return(list(goto = "editor"))
+  }
+  if (is.null(state$formatted)) {
+    return(list(goto = "formatter"))
+  }
+  list(goto = "chief")
+}
+
+drafter_node <- function(state) {
+  research <- paste(state$web_facts, state$data_facts, sep = "\n")
+  result <- lg_call_model(list(
+    list(role = "system", content = "Write a first draft based on the research."),
+    list(role = "user", content = paste0("Task: ", state$input, "\nResearch:\n", research))
+  ))
+  list(updates = list(draft = result), goto = "writing_team")
+}
+
+editor_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = "Edit this draft for clarity, grammar, and flow. Return only the edited text."),
+    list(role = "user", content = state$draft)
+  ))
+  list(updates = list(edited = result), goto = "writing_team")
+}
+
+formatter_node <- function(state) {
+  result <- lg_call_model(list(
+    list(role = "system", content = "Format this text with proper structure (headings, bullet points if needed). Return only the formatted text."),
+    list(role = "user", content = state$edited
+  ))
+  list(updates = list(formatted = result), goto = "writing_team")
+}
+
+graph <- hierarchical_graph |>
+  lg_add_node("chief", chief_node) |>
+  lg_add_node("research_team", research_team_node) |>
+  lg_add_node("web_researcher", web_researcher_node) |>
+  lg_add_node("data_researcher", data_researcher_node) |>
+  lg_add_node("writing_team", writing_team_node) |>
+  lg_add_node("drafter", drafter_node) |>
+  lg_add_node("editor", editor_node) |>
+  lg_add_node("formatter", formatter_node) |>
+  lg_compile()
+```
+
+---
+
+## 4. Agent Swarm (Peer-to-Peer)
+
+In a swarm, any agent can hand off to any other agent. This is the most flexible pattern.
+
+```r
+swarm_graph <- lg_graph("swarm",
+  state = list(
+    input = list(type = "str", reducer = "overwrite"),
+    messages = list(type = "list", reducer = "append"),
+    current_agent = list(type = "str", reducer = "overwrite"),
+    handoff = list(type = "str", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite"),
+    turns = list(type = "number", reducer = "overwrite")
+  ))
+
+# Router: figure out which agent should handle the current state
+router_node <- function(state) {
+  turns <- state$turns %||% 0
+
+  if (turns >= 5) {
+    return(list(updates = list(final = state$messages[[length(state$messages)]]$content)))
+  }
+
+  # Determine current agent
+  current <- state$current_agent %||% "generalist"
+
+  list(
+    updates = list(current_agent = current, turns = turns + 1),
+    goto = current
+  )
+}
+
+# Generalist agent: can hand off to specialists
+generalist_node <- function(state) {
+  response <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a generalist assistant. Answer the user's question.",
+      "If the question requires specialized knowledge, say 'HANDOFF: coder' or 'HANDOFF: data_scientist'.",
+      "Otherwise, answer directly and say 'DONE: <your answer>'."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  if (grepl("^HANDOFF:\\s*(\\w+)", response)) {
+    next_agent <- sub(".*HANDOFF:\\s*(\\w+).*", "\\1", response)
+    return(list(
+      updates = list(
+        messages = list(role = "generalist", content = response),
+        handoff = next_agent,
+        current_agent = next_agent
+      ),
+      goto = "router"
+    ))
+  }
+
+  answer <- sub("DONE:\\s*", "", response)
+  list(
+    updates = list(
+      messages = list(role = "generalist", content = answer),
+      final = answer
+    ),
+    goto = "router"
+  )
+}
+
+# Specialist: coder
+coder_node <- function(state) {
+  response <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a coding specialist. Provide code solutions.",
+      "When done, say 'DONE: <summary of your answer>'.",
+      "If you need general guidance, say 'HANDOFF: generalist'."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  if (grepl("^HANDOFF:", response)) {
+    return(list(
+      updates = list(current_agent = "generalist", handoff = "generalist"),
+      goto = "router"
+    ))
+  }
+
+  answer <- sub("DONE:\\s*", "", response)
+  list(
+    updates = list(
+      messages = list(role = "coder", content = answer),
+      final = answer
+    ),
+    goto = "router"
+  )
+}
+
+# Specialist: data scientist
+data_scientist_node <- function(state) {
+  response <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "You are a data science specialist. Help with analysis, statistics, and ML.",
+      "When done, say 'DONE: <summary>'.",
+      "If you need coding help, say 'HANDOFF: coder'."
+    )),
+    list(role = "user", content = state$input)
+  ))
+
+  if (grepl("^HANDOFF:", response)) {
+    next_agent <- sub(".*HANDOFF:\\s*(\\w+).*", "\\1", response)
+    return(list(
+      updates = list(current_agent = next_agent, handoff = next_agent),
+      goto = "router"
+    ))
+  }
+
+  answer <- sub("DONE:\\s*", "", response)
+  list(
+    updates = list(
+      messages = list(role = "data_scientist", content = answer),
+      final = answer
+    ),
+    goto = "router"
+  )
+}
+
+graph <- swarm_graph |>
+  lg_add_node("router", router_node) |>
+  lg_add_node("generalist", generalist_node) |>
+  lg_add_node("coder", coder_node) |>
+  lg_add_node("data_scientist", data_scientist_node) |>
+  lg_compile()
+
+result <- graph$invoke("Write an R function to perform linear regression and explain the statistics")
+result$state$final
+```
+
+---
+
+## Choosing a Pattern
+
+| If your task... | Use |
+|---|---|
+| Has clear, distinct steps | Supervisor |
+| Requires specialist collaboration | Network |
+| Is very complex with many specialties | Hierarchical |
+| Needs flexible agent-to-agent handoffs | Swarm |
+| Is a simple pipeline | Prompt chaining (see [Design Patterns](design-patterns.html)) |
+| Is a single agent with tools | ReAct via `lg_connect()` |
+
+---
+
+## Reusable Helper: Create a Supervisor Agent
+
+Here is a reusable R function that creates a supervisor system from a list of worker definitions:
+
+```r
+#' Create a supervisor multi-agent system
+#' @param workers Named list of lists, each with $system_prompt and $name
+#' @param max_turns Maximum agent activations before forced synthesis
+#' @return A compiled LgGraph
+create_supervisor <- function(workers, max_turns = 6) {
+  worker_names <- names(workers)
+
+  # Build the state schema
+  state <- list(
+    input = list(type = "str", reducer = "overwrite"),
+    current_worker = list(type = "str", reducer = "overwrite"),
+    turn_count = list(type = "number", reducer = "overwrite"),
+    final = list(type = "str", reducer = "overwrite")
+  )
+
+  # Add a result channel for each worker
+  for (name in worker_names) {
+    state[[paste0(name, "_result")]] <- list(type = "str", reducer = "overwrite")
+  }
+
+  g <- lg_graph("supervisor_system", state = state)
+
+  # Supervisor node
+  supervisor_fn <- function(state) {
+    turns <- state$turn_count %||% 0
+
+    if (turns >= max_turns) {
+      # Force completion
+      all_results <- sapply(worker_names, function(w) {
+        state[[paste0(w, "_result")]] %||% "not completed"
+      })
+      context <- paste(paste0(worker_names, ": ", all_results), collapse = "\n")
+
+      final <- lg_call_model(list(
+        list(role = "system", content = "Synthesize all worker outputs into a final answer."),
+        list(role = "user", content = paste0("Task: ", state$input, "\n\n", context))
+      ))
+      return(list(updates = list(final = final)))
+    }
+
+    # Decide next worker
+    done <- sapply(worker_names, function(w) !is.null(state[[paste0(w, "_result")]]))
+    remaining <- worker_names[!done]
+
+    if (length(remaining) == 0) {
+      # All done, synthesize
+      all_results <- sapply(worker_names, function(w) state[[paste0(w, "_result")]])
+      context <- paste(paste0(worker_names, ": ", all_results), collapse = "\n")
+
+      final <- lg_call_model(list(
+        list(role = "system", content = "Synthesize all worker outputs into a final answer."),
+        list(role = "user", content = paste0("Task: ", state$input, "\n\n", context))
+      ))
+      return(list(updates = list(final = final)))
+    }
+
+    # Ask LLM which worker to activate
+    decision <- lg_call_model(list(
+      list(role = "system", content = paste(
+        "You are a supervisor. Choose the next worker to activate.",
+        "Available workers:", paste(remaining, collapse = ", "),
+        "Respond with ONLY the worker name."
+      )),
+      list(role = "user", content = state$input)
+    ), temperature = 0)
+
+    next_worker <- trimws(tolower(decision))
+    if (!(next_worker %in% remaining)) next_worker <- remaining[1]
+
+    list(
+      updates = list(current_worker = next_worker, turn_count = turns + 1),
+      goto = next_worker
+    )
+  }
+
+  g <- lg_add_node(g, "supervisor", supervisor_fn)
+
+  # Create a worker node for each worker definition
+  for (name in worker_names) {
+    worker_def <- workers[[name]]
+    result_channel <- paste0(name, "_result")
+
+    worker_fn <- function(state) {
+      # Capture worker_def from the environment
+      prompt <- worker_def$system_prompt
+
+      response <- lg_call_model(list(
+        list(role = "system", content = prompt),
+        list(role = "user", content = state$input)
+      ))
+
+      updates <- list()
+      updates[[result_channel]] <- response
+      updates$current_worker <- "supervisor"
+
+      list(updates = updates, goto = "supervisor")
+    }
+
+    g <- lg_add_node(g, name, worker_fn)
+  }
+
+  lg_compile(g)
+}
+
+# Usage
+workers <- list(
+  researcher = list(system_prompt = "You are a research agent. Find and summarize key facts."),
+  analyst = list(system_prompt = "You are an analysis agent. Draw conclusions from data."),
+  writer = list(system_prompt = "You are a writing agent. Write clear, engaging content.")
+)
+
+system <- create_supervisor(workers)
+result <- system$invoke("Explain the impact of R on statistical computing")
+result$state$final
+```
+
+---
+
+## See Also
+
+- [Design Patterns](design-patterns.html) — single-agent patterns (chaining, routing, reflection)
+- [RAG Patterns](rag-patterns.html) — retrieval-augmented generation
+- [Advanced Recipes](advanced-recipes.html) — complete applications

@@ -1,0 +1,216 @@
+---
+title: "Memory & Threads"
+description: "Understand conversation memory, thread IDs, and durable persistence."
+vignette: >
+  %\VignetteIndexEntry{Memory & Threads}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Memory & Threads
+
+langgraphr uses LangGraph's checkpointer system to persist conversation state across runs. The unit of memory is the **thread ID** — reuse the same thread ID, and the agent or graph remembers everything from previous runs on that thread.
+
+---
+
+## Thread Basics
+
+### What is a thread?
+
+A thread is a conversation or run context. Each thread has its own independent state:
+
+- For **assistants**: the message history (all messages sent and received)
+- For **graphs**: the full state of all state channels
+
+Threads are stored by the checkpointer on the hidden server.
+
+### Thread IDs
+
+Thread IDs are plain strings. Generate a new one with `lg_thread_id()`:
+
+```r
+lg_thread_id()
+# "thread_20260906153012_7z1pa0"
+```
+
+The format is `thread_<timestamp>_<random>` for uniqueness and readability.
+
+You can also use any string as a thread ID — it does not have to follow this format.
+
+### Creating a new thread
+
+```r
+# Generate a fresh ID
+new_id <- lg_new_thread()
+
+# Or reset an existing agent/graph object
+agent$reset()
+graph$reset()
+```
+
+`$reset()` generates a new thread ID and assigns it to the object. Subsequent `invoke()` calls use the new thread.
+
+---
+
+## Memory Behavior
+
+### Assistants
+
+For `LgAgent`, memory means message history. The model sees all previous messages when you call `invoke()` again:
+
+```r
+agent <- lg_connect()
+
+# Turn 1
+agent$invoke("My name is Priya.")
+
+# Turn 2 — the model sees both messages
+result <- agent$invoke("What is my name?")
+result$content
+# "Your name is Priya."
+```
+
+### Graphs
+
+For `LgGraph`, memory means state channels persist across runs. Each `invoke()` starts fresh with the `input` channel, but other state channels retain their values from the last run:
+
+```r
+g <- lg_graph("accumulator",
+  state = list(total = list(type = "number", reducer = "overwrite"))
+)
+
+add_value <- function(state) {
+  current <- state$total %||% 0
+  new_val <- current + as.numeric(state$input)
+  list(updates = list(total = new_val))
+}
+
+graph <- g |> lg_add_node("add", add_value) |> lg_compile()
+
+graph$invoke("10")$state$total  # 10
+graph$invoke("5")$state$total   # 15
+graph$invoke("3")$state$total   # 18
+```
+
+---
+
+## Listing Threads
+
+See all threads the running server knows about:
+
+```r
+lg_threads()
+# [1] "thread_20260906_abc123" "thread_20260906_def456"
+```
+
+This returns a character vector of every thread ID the server has seen since it started (or since the SQLite database was created, if using durable memory).
+
+---
+
+## Durable Memory with SQLite
+
+By default, memory is stored in-process (`MemorySaver`) and is lost when the server stops. To make memory survive server restarts, use SQLite.
+
+### Enabling SQLite
+
+```r
+lg_use_sqlite("conversations.sqlite")
+```
+
+This sets the `LANGGRAPHR_DB` environment variable. The server reads this variable when it boots and uses `SqliteSaver` instead of `MemorySaver`.
+
+The change takes effect the next time the server starts. If the server is already running, restart it:
+
+```r
+lg_stop_server()
+agent <- lg_connect()
+```
+
+### Per-graph memory
+
+For the graph authoring path, you can set a per-graph database path:
+
+```r
+g <- lg_graph("my_graph",
+  state = list(value = list(type = "number"))
+) |>
+  lg_add_node("step", my_node) |>
+  lg_set_memory(db_path = "my_graph.sqlite") |>
+  lg_compile()
+```
+
+`lg_set_memory()` stores the path on the builder. The compiler passes it to the server during registration.
+
+### How it works
+
+SQLite memory uses the `langgraph-checkpoint-sqlite` package. Each thread's checkpoints are stored in a SQLite database file. The database contains the full state of each thread at every step.
+
+- The SQLite connection is kept alive for the lifetime of the server process
+- `check_same_thread = FALSE` because requests arrive on different server threads
+- The database file is created automatically if it does not exist
+
+---
+
+## Memory and the Server
+
+### Server restarts
+
+When you stop and restart the server:
+
+- **In-memory mode** — all threads and their state are lost
+- **SQLite mode** — threads and their state survive (they are stored in the database file)
+
+### Multiple R sessions
+
+Multiple R sessions can share the same server (and therefore the same memory):
+
+```r
+# Session 1
+agent <- lg_connect(thread_id = "shared_chat")
+agent$invoke("Remember: X = 42.")
+
+# Session 2 (different R process, same server port)
+agent <- lg_connect(thread_id = "shared_chat")
+result <- agent$invoke("What is X?")
+# The agent remembers
+```
+
+Both sessions talk to the same hidden server on the same port, so they share the same checkpointer.
+
+---
+
+## Best Practices
+
+### Naming threads
+
+Use descriptive thread IDs when you need to look them up later:
+
+```r
+# Good — meaningful names
+agent <- lg_connect(thread_id = "customer_123_chat")
+agent <- lg_connect(thread_id = "analysis_project_alpha")
+
+# Also fine — auto-generated
+agent <- lg_connect()
+```
+
+### Thread safety
+
+- Each thread should be used by one logical conversation at a time
+- Concurrent writes to the same thread from different R processes can cause race conditions
+- For parallel workloads, use separate thread IDs
+
+### Cleaning up
+
+There is no built-in "delete thread" function yet. To clean up old threads:
+
+- In-memory: restart the server (`lg_stop_server(); lg_start_server()`)
+- SQLite: delete the `.sqlite` file or use SQL to remove specific entries
+
+---
+
+## See Also
+
+- [Assistant Agents](assistant-agents.html) — using memory with the assistant path
+- [Graph Authoring](graph-authoring.html) — state channels and reducers
+- [Architecture](architecture.html) — how the checkpointer integrates with LangGraph

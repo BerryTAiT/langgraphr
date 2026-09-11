@@ -1,0 +1,776 @@
+---
+title: "RAG Patterns"
+description: "Build retrieval-augmented generation systems — basic, adaptive, corrective, and self-RAG in pure R."
+vignette: >
+  %\VignetteIndexEntry{RAG Patterns}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# RAG Patterns
+
+Retrieval-Augmented Generation (RAG) combines a retriever (finding relevant documents) with a generator (LLM that answers using those documents). This guide covers four RAG architectures, from simplest to most advanced.
+
+---
+
+## Why RAG?
+
+LLMs have fixed training data. RAG lets you:
+- Answer questions about your own documents
+- Cite sources
+- Reduce hallucinations
+- Update knowledge without retraining
+
+---
+
+## Pattern Overview
+
+| Pattern | How it works | When to use |
+|---|---|---|
+| **Basic RAG** | Retrieve → Generate | Simple Q&A over a document set |
+| **Adaptive RAG** | Decide if retrieval is needed, then retrieve | Mixed questions (some need docs, some do not) |
+| **Corrective RAG** | Retrieve, grade results, rewrite query if needed | High-accuracy requirements |
+| **Self-RAG** | Grade retrieval, grade generation, retry | Maximum accuracy, self-correction |
+
+---
+
+## Building Blocks
+
+All RAG patterns share these components. You write them in R — no external vector database required for prototyping.
+
+### Simple retriever (keyword-based)
+
+```r
+#' Create a keyword-based retriever from a character vector of documents
+#' @param corpus Character vector of documents
+#' @return A function(query, k) that returns the top-k matching documents
+create_keyword_retriever <- function(corpus) {
+  function(query, k = 3) {
+    # Tokenize the query
+    words <- tolower(strsplit(gsub("[^A-Za-z0-9 ]", " ", query), "\\s+")[[1]])
+    words <- words[nchar(words) > 2]
+
+    # Score each document by keyword overlap
+    scores <- vapply(corpus, function(doc) {
+      doc_lower <- tolower(doc)
+      sum(vapply(words, function(w) grepl(w, doc_lower, fixed = TRUE), logical(1)))
+    }, numeric(1))
+
+    # Return top-k
+    idx <- order(scores, decreasing = TRUE)
+    idx <- idx[scores[idx] > 0]
+    head(idx, k)
+  }
+}
+```
+
+### TF-IDF retriever (better quality)
+
+```r
+#' Create a TF-IDF retriever
+#' @param corpus Character vector of documents
+#' @return A function(query, k) that returns top-k document indices
+create_tfidf_retriever <- function(corpus) {
+  # Build the vocabulary
+  docs_tokens <- strsplit(tolower(gsub("[^A-Za-z0-9 ]", " ", corpus)), "\\s+")
+  vocab <- unique(unlist(docs_tokens))
+  vocab <- vocab[nchar(vocab) > 2]
+
+  # Compute document frequency
+  df <- vapply(vocab, function(term) {
+    sum(vapply(docs_tokens, function(tokens) term %in% tokens, logical(1)))
+  }, numeric(1))
+
+  # Compute IDF
+  n_docs <- length(corpus)
+  idf <- log(n_docs / df)
+
+  # Compute TF-IDF vectors for each document
+  doc_vectors <- lapply(docs_tokens, function(tokens) {
+    tf <- table(factor(tokens[tokens %in% vocab], levels = vocab))
+    as.numeric(tf) * idf
+  })
+
+  # Return retriever function
+  function(query, k = 3) {
+    query_tokens <- strsplit(tolower(gsub("[^A-Za-z0-9 ]", " ", query)), "\\s+")[[1]]
+    query_tf <- table(factor(query_tokens[query_tokens %in% vocab], levels = vocab))
+    query_vec <- as.numeric(query_tf) * idf
+
+    # Cosine similarity
+    scores <- vapply(doc_vectors, function(doc_vec) {
+      sum(query_vec * doc_vec) / (sqrt(sum(query_vec^2)) * sqrt(sum(doc_vec^2)) + 1e-10)
+    }, numeric(1))
+
+    idx <- order(scores, decreasing = TRUE)
+    idx <- idx[scores[idx] > 0]
+    head(idx, k)
+  }
+}
+```
+
+### Embedding-based retriever (best quality)
+
+If you have an embedding model available, use cosine similarity on embeddings:
+
+```r
+#' Create an embedding-based retriever using lg_call_model for embeddings
+#' @param corpus Character vector of documents
+#' @return A function(query, k) that returns top-k document indices
+create_embedding_retriever <- function(corpus) {
+  # Compute embeddings for all documents
+  # This uses lg_call_model if your provider supports embeddings,
+  # or falls back to a hash-based pseudo-embedding for prototyping
+  doc_embeddings <- lapply(corpus, function(doc) {
+    # Simple hash-based embedding (replace with real embeddings in production)
+    words <- strsplit(tolower(doc), "\\W+")[[1]]
+    words <- words[nchar(words) > 0]
+    vec <- rep(0, 100)
+    for (w in words) {
+      hash <- sum(charToRaw(w)) %% 100 + 1
+      vec[hash] <- vec[hash] + 1
+    }
+    vec / (sqrt(sum(vec^2)) + 1e-10)
+  })
+
+  function(query, k = 3) {
+    # Embed the query
+    words <- strsplit(tolower(query), "\\W+")[[1]]
+    words <- words[nchar(words) > 0]
+    query_vec <- rep(0, 100)
+    for (w in words) {
+      hash <- sum(charToRaw(w)) %% 100 + 1
+      query_vec[hash] <- query_vec[hash] + 1
+    }
+    query_vec <- query_vec / (sqrt(sum(query_vec^2)) + 1e-10)
+
+    # Cosine similarity
+    scores <- sapply(doc_embeddings, function(doc_vec) {
+      sum(query_vec * doc_vec)
+    })
+
+    head(order(scores, decreasing = TRUE), k)
+  }
+}
+```
+
+### Document store with metadata
+
+```r
+#' Create a document store
+#' @param documents List of lists with $text and $metadata
+create_doc_store <- function(documents) {
+  list(
+    docs = documents,
+    texts = sapply(documents, function(d) d$text),
+    add = function(doc) {
+      documents <<- c(documents, list(doc))
+    },
+    get_all = function() documents,
+    get_text = function() sapply(documents, function(d) d$text)
+  )
+}
+```
+
+---
+
+## 1. Basic RAG
+
+Retrieve documents, stuff them into the prompt, generate an answer. The simplest effective RAG.
+
+```r
+library(langgraphr)
+
+# Sample corpus
+corpus <- c(
+  "langgraphr lets R developers build AI agents on the LangGraph engine.",
+  "lg_connect() gives an assistant whose tools are R functions.",
+  "lg_graph(), lg_add_node() and lg_compile() build stateful R-node graphs.",
+  "Thread memory persists across calls; lg_use_sqlite() makes it durable.",
+  "lg_call_model() calls an OpenAI-compatible model directly from R.",
+  "The hidden server uses FastAPI and uvicorn to run LangGraph in Python."
+)
+
+retriever <- create_tfidf_retriever(corpus)
+
+basic_rag <- lg_graph("basic_rag",
+  state = list(
+    question = list(type = "str", reducer = "overwrite"),
+    context_docs = list(type = "list", reducer = "overwrite"),
+    answer = list(type = "str", reducer = "overwrite")
+  ))
+
+retrieve_node <- function(state) {
+  idx <- retriever(state$input, k = 2)
+  docs <- if (length(idx) > 0) corpus[idx] else character(0)
+
+  list(
+    updates = list(
+      question = state$input,
+      context_docs = docs
+    ),
+    goto = "generate"
+  )
+}
+
+generate_node <- function(state) {
+  context <- paste(state$context_docs, collapse = "\n\n")
+
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Answer the question using ONLY the context below.",
+      "If the context is insufficient, say 'I don't have enough information.'",
+      "\n\nContext:\n", context
+    )),
+    list(role = "user", content = state$question)
+  ))
+
+  list(updates = list(answer = answer))
+}
+
+rag_graph <- basic_rag |>
+  lg_add_node("retrieve", retrieve_node) |>
+  lg_add_node("generate", generate_node) |>
+  lg_add_edge("retrieve", "generate") |>
+  lg_compile()
+
+result <- rag_graph$invoke("How do I build a graph in R?")
+result$state$answer
+result$state$context_docs  # see which docs were retrieved
+```
+
+### With citations
+
+```r
+generate_with_citations <- function(state) {
+  context <- paste(state$context_docs, collapse = "\n\n")
+
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Answer using ONLY the context below.",
+      "After each claim, cite the source as [Doc N] where N is the document number.",
+      "If the context is insufficient, say so.",
+      "\n\nContext:\n",
+      paste(paste0("[Doc ", seq_along(state$context_docs), "] ",
+                   state$context_docs), collapse = "\n\n")
+    )),
+    list(role = "user", content = state$question)
+  ))
+
+  list(updates = list(answer = answer))
+}
+```
+
+---
+
+## 2. Adaptive RAG
+
+Not every question needs retrieval. "What is 2+2?" does not need a document lookup. Adaptive RAG decides whether to retrieve before answering.
+
+```r
+adaptive_rag <- lg_graph("adaptive_rag",
+  state = list(
+    question = list(type = "str", reducer = "overwrite"),
+    needs_retrieval = list(type = "boolean", reducer = "overwrite"),
+    context_docs = list(type = "list", reducer = "overwrite"),
+    answer = list(type = "str", reducer = "overwrite")
+  ))
+
+# Decision node: does this question need document retrieval?
+assess_node <- function(state) {
+  decision <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Determine if the question requires looking up external documents.",
+      "Questions about specific documents, policies, or proprietary information: YES",
+      "General knowledge, math, or opinions: NO",
+      "Respond with only YES or NO."
+    )),
+    list(role = "user", content = state$input)
+  ), temperature = 0)
+
+  needs <- grepl("YES", decision, ignore.case = TRUE)
+
+  list(
+    updates = list(
+      question = state$input,
+      needs_retrieval = needs
+    ),
+    goto = if (needs) "retrieve" else "generate_direct"
+  )
+}
+
+retrieve_node <- function(state) {
+  idx <- retriever(state$question, k = 3)
+  docs <- if (length(idx) > 0) corpus[idx] else character(0)
+  list(updates = list(context_docs = docs), goto = "generate_with_context")
+}
+
+generate_with_context_node <- function(state) {
+  context <- paste(state$context_docs, collapse = "\n\n")
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste("Answer using this context:\n\n", context)),
+    list(role = "user", content = state$question)
+  ))
+  list(updates = list(answer = answer))
+}
+
+generate_direct_node <- function(state) {
+  answer <- lg_call_model(list(
+    list(role = "system", content = "You are a helpful assistant."),
+    list(role = "user", content = state$question)
+  ))
+  list(updates = list(answer = answer))
+}
+
+rag_graph <- adaptive_rag |>
+  lg_add_node("assess", assess_node) |>
+  lg_add_node("retrieve", retrieve_node) |>
+  lg_add_node("generate_with_context", generate_with_context_node) |>
+  lg_add_node("generate_direct", generate_direct_node) |>
+  lg_add_edge("assess", "retrieve") |>
+  lg_add_edge("retrieve", "generate_with_context") |>
+  lg_compile()
+
+# Questions that need retrieval
+r1 <- rag_graph$invoke("What does lg_connect() do?")
+
+# Questions that do not need retrieval
+r2 <- rag_graph$invoke("What is the capital of France?")
+```
+
+---
+
+## 3. Corrective RAG (CRAG)
+
+Retrieve, then grade the retrieved documents. If they are not relevant, rewrite the query and try again. Only generate when you have good context.
+
+```r
+crag <- lg_graph("crag",
+  state = list(
+    question = list(type = "str", reducer = "overwrite"),
+    context_docs = list(type = "list", reducer = "overwrite"),
+    doc_grade = list(type = "number", reducer = "overwrite"),
+    rewritten_query = list(type = "str", reducer = "overwrite"),
+    retry_count = list(type = "number", reducer = "overwrite"),
+    answer = list(type = "str", reducer = "overwrite")
+  ))
+
+retrieve_node <- function(state) {
+  query <- state$rewritten_query %||% state$input
+  idx <- retriever(query, k = 3)
+  docs <- if (length(idx) > 0) corpus[idx] else character(0)
+  list(
+    updates = list(
+      question = state$input,
+      context_docs = docs,
+      rewritten_query = query
+    ),
+    goto = "grade"
+  )
+}
+
+# Grade the retrieved documents
+grade_node <- function(state) {
+  if (length(state$context_docs) == 0) {
+    return(list(updates = list(doc_grade = 0), goto = "rewrite"))
+  }
+
+  context <- paste(state$context_docs, collapse = "\n\n")
+  grade <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Grade the relevance of these documents to the question.",
+      "Respond with only a number 1-10.",
+      "10 = perfectly relevant, 1 = completely irrelevant."
+    )),
+    list(role = "user", content = paste0(
+      "Question: ", state$question,
+      "\n\nDocuments:\n", context
+    ))
+  ), temperature = 0)
+
+  score <- as.numeric(trimws(grade))
+  if (is.na(score)) score <- 5
+
+  retries <- state$retry_count %||% 0
+
+  # If documents are good enough, generate. If not, rewrite and retry.
+  goto <- if (score >= 6 || retries >= 2) "generate" else "rewrite"
+
+  list(updates = list(doc_grade = score, retry_count = retries), goto = goto)
+}
+
+# Rewrite the query for better retrieval
+rewrite_node <- function(state) {
+  rewritten <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Rewrite the question to improve document retrieval.",
+      "Use different keywords, synonyms, or rephrase.",
+      "Return ONLY the rewritten question, nothing else."
+    )),
+    list(role = "user", content = state$question)
+  ))
+
+  retries <- (state$retry_count %||% 0) + 1
+
+  list(
+    updates = list(rewritten_query = trimws(rewritten), retry_count = retries),
+    goto = "retrieve"
+  )
+}
+
+# Generate the answer with good context
+generate_node <- function(state) {
+  context <- paste(state$context_docs, collapse = "\n\n")
+
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Answer the question using the context.",
+      "If the context does not fully answer the question, acknowledge the gap.",
+      "\n\nContext:\n", context
+    )),
+    list(role = "user", content = state$question)
+  ))
+
+  list(updates = list(answer = answer))
+}
+
+rag_graph <- crag |>
+  lg_add_node("retrieve", retrieve_node) |>
+  lg_add_node("grade", grade_node) |>
+  lg_add_node("rewrite", rewrite_node) |>
+  lg_add_node("generate", generate_node) |>
+  lg_add_edge("retrieve", "grade") |>
+  lg_add_edge("grade", "rewrite") |>
+  lg_add_edge("rewrite", "retrieve") |>
+  lg_compile()
+
+result <- rag_graph$invoke("How does memory persistence work?")
+result$state$answer
+result$state$doc_grade        # quality of retrieved docs
+result$state$retry_count       # how many query rewrites
+result$state$rewritten_query   # final query used
+```
+
+---
+
+## 4. Self-RAG
+
+The most advanced pattern. The LLM grades its own retrieval, decides to generate, then grades its own answer — retrying at each stage if quality is low.
+
+```r
+self_rag <- lg_graph("self_rag",
+  state = list(
+    question = list(type = "str", reducer = "overwrite"),
+    context_docs = list(type = "list", reducer = "overwrite"),
+    retrieval_grade = list(type = "str", reducer = "overwrite"),  # "relevant" or "irrelevant"
+    answer = list(type = "str", reducer = "overwrite"),
+    generation_grade = list(type = "str", reducer = "overwrite"),  # "grounded" or "not_grounded"
+    useful = list(type = "str", reducer = "overwrite"),            # "useful" or "not_useful"
+    retry_count = list(type = "number", reducer = "overwrite"),
+    final_answer = list(type = "str", reducer = "overwrite")
+  ))
+
+# Step 1: Retrieve documents
+retrieve_node <- function(state) {
+  idx <- retriever(state$input, k = 3)
+  docs <- if (length(idx) > 0) corpus[idx] else character(0)
+  list(
+    updates = list(question = state$input, context_docs = docs),
+    goto = "grade_retrieval"
+  )
+}
+
+# Step 2: Grade whether the retrieved docs are relevant
+grade_retrieval_node <- function(state) {
+  if (length(state$context_docs) == 0) {
+    return(list(updates = list(retrieval_grade = "irrelevant"), goto = "decide_generate"))
+  }
+
+  context <- paste(state$context_docs, collapse = "\n\n")
+  grade <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Are these documents relevant to the question?",
+      "Respond with ONLY 'relevant' or 'irrelevant'."
+    )),
+    list(role = "user", content = paste0(
+      "Question: ", state$question,
+      "\n\nDocuments:\n", context
+    ))
+  ), temperature = 0)
+
+  grade <- trimws(tolower(grade))
+  if (!grade %in% c("relevant", "irrelevant")) grade <- "irrelevant"
+
+  list(updates = list(retrieval_grade = grade), goto = "decide_generate")
+}
+
+# Step 3: Decide whether to generate (relevant docs) or generate without (irrelevant)
+decide_generate_node <- function(state) {
+  goto <- if (identical(state$retrieval_grade, "relevant")) {
+    "generate_with_context"
+  } else {
+    "generate_without_context"
+  }
+  list(goto = goto)
+}
+
+# Step 4a: Generate with context
+generate_with_context_node <- function(state) {
+  context <- paste(state$context_docs, collapse = "\n\n")
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste("Answer using this context:\n\n", context)),
+    list(role = "user", content = state$question)
+  ))
+  list(updates = list(answer = answer), goto = "grade_generation")
+}
+
+# Step 4b: Generate without context (retrieval found nothing useful)
+generate_without_context_node <- function(state) {
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "No relevant documents were found.",
+      "Answer from your own knowledge, but note that you lack supporting documents."
+    )),
+    list(role = "user", content = state$question)
+  ))
+  list(updates = list(answer = answer), goto = "grade_generation")
+}
+
+# Step 5: Grade whether the answer is grounded in the context
+grade_generation_node <- function(state) {
+  # If there was no context, skip grounding check
+  if (length(state$context_docs) == 0) {
+    return(list(updates = list(generation_grade = "no_context"), goto = "check_useful"))
+  }
+
+  context <- paste(state$context_docs, collapse = "\n\n")
+  grade <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Is the answer grounded in and supported by the context?",
+      "Respond with ONLY 'grounded' or 'not_grounded'."
+    )),
+    list(role = "user", content = paste0(
+      "Context:\n", context,
+      "\n\nAnswer: ", state$answer
+    ))
+  ), temperature = 0)
+
+  grade <- trimws(tolower(grade))
+  if (!grade %in% c("grounded", "not_grounded")) grade <- "not_grounded"
+
+  list(
+    updates = list(generation_grade = grade),
+    goto = if (grade == "grounded") "check_useful" else "regenerate"
+  )
+}
+
+# Step 5b: Regenerate if not grounded
+regenerate_node <- function(state) {
+  retries <- (state$retry_count %||% 0) + 1
+  if (retries >= 2) {
+    return(list(updates = list(retry_count = retries), goto = "check_useful"))
+  }
+
+  context <- paste(state$context_docs, collapse = "\n\n")
+  answer <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Your previous answer was not grounded in the context.",
+      "Rewrite your answer using ONLY information from the context.",
+      "\n\nContext:\n", context
+    )),
+    list(role = "user", content = state$question)
+  ), temperature = 0.3)
+
+  list(
+    updates = list(answer = answer, retry_count = retries),
+    goto = "grade_generation"
+  )
+}
+
+# Step 6: Check if the answer is useful to the user
+check_useful_node <- function(state) {
+  useful <- lg_call_model(list(
+    list(role = "system", content = paste(
+      "Is this answer useful for the user's question?",
+      "Respond with ONLY 'useful' or 'not_useful'."
+    )),
+    list(role = "user", content = paste0(
+      "Question: ", state$question,
+      "\n\nAnswer: ", state$answer
+    ))
+  ), temperature = 0)
+
+  useful <- trimws(tolower(useful))
+  if (!useful %in% c("useful", "not_useful")) useful <- "useful"
+
+  list(updates = list(useful = useful, final_answer = state$answer))
+}
+
+rag_graph <- self_rag |>
+  lg_add_node("retrieve", retrieve_node) |>
+  lg_add_node("grade_retrieval", grade_retrieval_node) |>
+  lg_add_node("decide_generate", decide_generate_node) |>
+  lg_add_node("generate_with_context", generate_with_context_node) |>
+  lg_add_node("generate_without_context", generate_without_context_node) |>
+  lg_add_node("grade_generation", grade_generation_node) |>
+  lg_add_node("regenerate", regenerate_node) |>
+  lg_add_node("check_useful", check_useful_node) |>
+  lg_add_edge("grade_generation", "regenerate") |>
+  lg_add_edge("regenerate", "grade_generation") |>
+  lg_compile()
+
+result <- rag_graph$invoke("How do I persist conversation memory?")
+result$state$final_answer
+result$state$retrieval_grade    # "relevant" or "irrelevant"
+result$state$generation_grade   # "grounded" or "not_grounded"
+result$state$useful              # "useful" or "not_useful"
+```
+
+---
+
+## RAG with File Loading
+
+Here is a complete RAG system that loads documents from files:
+
+```r
+#' Load documents from a directory
+#' @param dir_path Path to a directory with .txt, .md, or .csv files
+#' @return Character vector of document texts
+load_documents <- function(dir_path) {
+  files <- list.files(dir_path, pattern = "\\.(txt|md|csv)$",
+                      full.names = TRUE, ignore.case = TRUE)
+
+  docs <- lapply(files, function(f) {
+    ext <- tolower(tools::file_ext(f))
+    if (ext == "csv") {
+      df <- read.csv(f)
+      paste(names(df), collapse = ", ")
+    } else {
+      paste(readLines(f, warn = FALSE), collapse = "\n")
+    }
+  })
+
+  unlist(docs)
+}
+
+#' Build a complete RAG system from a directory of documents
+#' @param dir_path Path to documents
+#' @return A compiled LgGraph
+build_rag_from_dir <- function(dir_path) {
+  corpus <- load_documents(dir_path)
+  retriever <- create_tfidf_retriever(corpus)
+
+  rag <- lg_graph("file_rag",
+    state = list(
+      question = list(type = "str", reducer = "overwrite"),
+      context_docs = list(type = "list", reducer = "overwrite"),
+      answer = list(type = "str", reducer = "overwrite")
+    ))
+
+  rag <- lg_add_node(rag, "retrieve", function(state) {
+    idx <- retriever(state$input, k = 3)
+    docs <- if (length(idx) > 0) corpus[idx] else character(0)
+    list(updates = list(question = state$input, context_docs = docs), goto = "generate")
+  })
+
+  rag <- lg_add_node(rag, "generate", function(state) {
+    context <- paste(state$context_docs, collapse = "\n\n---\n\n")
+    answer <- lg_call_model(list(
+      list(role = "system", content = paste(
+        "Answer the question using the provided documents.",
+        "Cite sources by document number.",
+        "\n\nDocuments:\n", context
+      )),
+      list(role = "user", content = state$question)
+    ))
+    list(updates = list(answer = answer))
+  })
+
+  lg_add_edge(rag, "retrieve", "generate") |> lg_compile()
+}
+
+# Usage
+# rag_system <- build_rag_from_dir("my_documents")
+# result <- rag_system$invoke("What is the refund policy?")
+```
+
+---
+
+## Chunking Strategies
+
+For long documents, split them into chunks before indexing:
+
+```r
+#' Split a long text into overlapping chunks
+#' @param text Character string
+#' @param chunk_size Maximum characters per chunk
+#' @param overlap Overlap between chunks
+#' @return Character vector of chunks
+chunk_text <- function(text, chunk_size = 500, overlap = 50) {
+  n <- nchar(text)
+  if (n <= chunk_size) return(text)
+
+  chunks <- c()
+  start <- 1
+  while (start <= n) {
+    end <- min(start + chunk_size - 1, n)
+    chunks <- c(chunks, substr(text, start, end))
+    start <- end - overlap + 1
+  }
+  chunks
+}
+
+#' Chunk and index a directory of files
+#' @param dir_path Path to documents
+#' @return List with $corpus (chunks) and $retriever (function)
+build_chunked_index <- function(dir_path, chunk_size = 500) {
+  files <- list.files(dir_path, pattern = "\\.(txt|md)$",
+                      full.names = TRUE, ignore.case = TRUE)
+
+  all_chunks <- c()
+  chunk_meta <- list()  # track which file each chunk came from
+
+  for (f in files) {
+    text <- paste(readLines(f, warn = FALSE), collapse = "\n")
+    chunks <- chunk_text(text, chunk_size = chunk_size)
+    all_chunks <- c(all_chunks, chunks)
+    for (i in seq_along(chunks)) {
+      chunk_meta[[length(chunk_meta) + 1]] <- list(
+        file = basename(f),
+        chunk = i,
+        text = chunks[i]
+      )
+    }
+  }
+
+  retriever <- create_tfidf_retriever(all_chunks)
+
+  list(
+    corpus = all_chunks,
+    meta = chunk_meta,
+    retriever = retriever
+  )
+}
+```
+
+---
+
+## Choosing a RAG Pattern
+
+| Your situation | Use |
+|---|---|
+| Simple Q&A, small corpus | Basic RAG |
+| Mixed questions (some general, some specific) | Adaptive RAG |
+| Need high accuracy, have noisy docs | Corrective RAG |
+| Maximum accuracy, willing to pay for extra LLM calls | Self-RAG |
+| Have many large files | Chunk + Basic RAG |
+| Need to cite sources | Basic RAG with citation prompt |
+
+---
+
+## See Also
+
+- [Design Patterns](design-patterns.html) — single-agent patterns
+- [Multi-Agent Systems](multi-agent-systems.html) — collaborative agents
+- [Advanced Recipes](advanced-recipes.html) — complete applications
+- [Tools & Models](tools-and-models.html) — model calls and tool schemas

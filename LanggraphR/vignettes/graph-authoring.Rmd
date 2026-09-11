@@ -1,0 +1,427 @@
+---
+title: "Graph Authoring"
+description: "Build custom stateful graphs in pure R using the graph DSL."
+vignette: >
+  %\VignetteIndexEntry{Graph Authoring}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Graph Authoring
+
+The full-authoring path lets you build custom LangGraph graphs where every node is an R function. You define the state shape, the nodes, and the connections — LangGraph handles the execution, state management, and checkpoints.
+
+This path does not require an LLM. You can build pure state machines, data pipelines, multi-step workflows, or anything else that fits a graph structure.
+
+---
+
+## Core Concepts
+
+### State
+
+Every graph has **state** — a collection of named channels that carry data between nodes. Each channel has a type and a reducer.
+
+```r
+g <- lg_graph("my_graph",
+  state = list(
+    counter = list(type = "number", reducer = "overwrite"),
+    history = list(type = "list",   reducer = "append"),
+    status  = list(type = "str",    reducer = "overwrite")
+  ))
+```
+
+**Types:**
+- `"str"` — character string
+- `"number"` — numeric value
+- `"boolean"` — logical TRUE/FALSE
+- `"list"` — list/array
+- `"any"` — any value
+
+**Reducers:**
+- `"overwrite"` — new value replaces the old one (default)
+- `"append"` — new value is appended to the existing list
+
+### Nodes
+
+Nodes are R functions that receive the current state and return:
+
+```r
+list(
+  updates = list(...),   # state channel updates
+  goto = "next_node"     # which node to visit next (NULL = follow default edge)
+)
+```
+
+Return `goto = "__end__"` (or omit `goto` with no default edge) to end the graph run.
+
+### Edges
+
+Edges define the default flow between nodes. They are used when a node returns no explicit `goto`.
+
+```r
+g <- g |> lg_add_edge("node_a", "node_b")
+```
+
+---
+
+## Building a Graph
+
+### Step 1: Create the graph builder
+
+```r
+g <- lg_graph("workflow",
+  state = list(
+    data   = list(type = "list", reducer = "overwrite"),
+    result = list(type = "list", reducer = "overwrite"),
+    log    = list(type = "list", reducer = "append")
+  ))
+```
+
+### Step 2: Add nodes
+
+```r
+load_data <- function(state) {
+  # The 'input' channel always contains the invoke() argument
+  path <- state$input
+
+  data <- read.csv(path)
+
+  list(
+    updates = list(
+      data = data,
+      log = paste("Loaded", nrow(data), "rows from", path)
+    ),
+    goto = "process"
+  )
+}
+
+process_data <- function(state) {
+  data <- state$data
+  result <- list(
+    total = sum(data$value),
+    avg = mean(data$value),
+    max = max(data$value)
+  )
+
+  list(
+    updates = list(
+      result = result,
+      log = "Processing complete"
+    )
+    # no goto = follow default edge
+  )
+}
+
+save_output <- function(state) {
+  result <- state$result
+  out_path <- tempfile(fileext = ".json")
+  jsonlite::write_json(result, out_path)
+
+  list(
+    updates = list(
+      log = paste("Saved output to", out_path)
+    )
+  )
+}
+
+g <- g |>
+  lg_add_node("load", load_data) |>
+  lg_add_node("process", process_data) |>
+  lg_add_node("save", save_output)
+```
+
+### Step 3: Add default edges
+
+```r
+g <- g |>
+  lg_add_edge("load", "process") |>
+  lg_add_edge("process", "save")
+```
+
+### Step 4: Compile and run
+
+```r
+graph <- lg_compile(g)
+
+result <- graph$invoke("data.csv")
+
+result$state$result
+# $total
+# [1] 1500
+#
+# $avg
+# [1] 150
+#
+# $max
+# [1] 280
+
+result$state$log
+# [[1]]
+# [1] "Loaded 10 rows from data.csv"
+#
+# [[2]]
+# [1] "Processing complete"
+#
+# [[3]]
+# [1] "Saved output to /tmp/..."
+```
+
+---
+
+## Control Flow
+
+### Conditional branching
+
+A node can decide its next node based on the state:
+
+```r
+classify <- function(state) {
+  val <- as.numeric(state$input)
+
+  if (val > 100) {
+    list(updates = list(value = val), goto = "high")
+  } else if (val > 50) {
+    list(updates = list(value = val), goto = "medium")
+  } else {
+    list(updates = list(value = val), goto = "low")
+  }
+}
+```
+
+### Loops
+
+A node can route to itself to create a loop:
+
+```r
+countdown <- function(state) {
+  n <- state$count
+  if (is.null(n)) n <- as.numeric(state$input)
+
+  if (n > 0) {
+    list(
+      updates = list(count = n - 1, log = paste("tick", n - 1)),
+      goto = "countdown"   # loop back
+    )
+  } else {
+    list(updates = list(log = "done"))
+  }
+}
+
+g <- lg_graph("countdown",
+  state = list(
+    count = list(type = "number", reducer = "overwrite"),
+    log   = list(type = "list",   reducer = "append")
+  )) |>
+  lg_add_node("countdown", countdown) |>
+  lg_compile()
+
+result <- g$invoke("3")
+result$state$log
+# [[1]] "tick 2"
+# [[2]] "tick 1"
+# [[3]] "tick 0"
+# [[4]] "done"
+```
+
+### Early termination
+
+Any node can end the run by returning no `goto` (when there is no default edge) or `goto = "__end__"`:
+
+```r
+validate <- function(state) {
+  data <- state$input_data
+
+  if (nrow(data) == 0) {
+    list(
+      updates = list(error = "No data provided"),
+      goto = "__end__"   # stop immediately
+    )
+  } else {
+    list(goto = "process")
+  }
+}
+```
+
+---
+
+## State Reducers
+
+### Overwrite (default)
+
+Each update replaces the current value. Good for single values.
+
+```r
+state = list(current_step = list(type = "str", reducer = "overwrite"))
+```
+
+### Append
+
+Each update is added to the end of a list. Good for logs, history, message queues.
+
+```r
+state = list(history = list(type = "list", reducer = "append"))
+```
+
+With append reducers, each update you send is a **single element** to append:
+
+```r
+# In a node function:
+list(updates = list(history = "step completed"))
+# This appends one element to the history list
+```
+
+---
+
+## The `input` Channel
+
+Every graph automatically gets an `input` channel that receives the argument passed to `$invoke()`. It is always a string.
+
+```r
+# When you call:
+graph$invoke("hello world")
+
+# In your node function:
+my_node <- function(state) {
+  state$input   # "hello world"
+  # ...
+}
+```
+
+The `input` channel is an `overwrite` channel — it is set once at the start of the run and stays available throughout.
+
+---
+
+## Graph Compilation
+
+`lg_compile()` does three things:
+
+1. Validates the graph spec (all nodes referenced in edges exist, etc.)
+2. Sends the spec to the hidden server as JSON
+3. The server builds a real LangGraph `StateGraph` from the spec
+4. Returns an `LgGraph` object bound to the compiled graph
+
+You can re-compile a graph with the same ID — the new version replaces the old one. This is useful during development.
+
+---
+
+## LgGraph Methods
+
+### `$invoke(input, thread_id, max_rounds)`
+
+Run the graph with the given input text. Returns the final state.
+
+```r
+result <- graph$invoke("starting value")
+result$state   # final state as a named list
+result$status  # "completed"
+```
+
+- `thread_id` — use a specific thread (default: the object's current thread)
+- `max_rounds` — safety cap on node interrupts (default 100)
+
+### `$reset()`
+
+Start a fresh thread (clears memory for this graph object).
+
+```r
+graph$reset()
+```
+
+---
+
+## Using LLMs in Graph Nodes
+
+You can call an LLM from inside a graph node using `lg_call_model()`:
+
+```r
+analyze_node <- function(state) {
+  data <- state$data
+
+  prompt <- paste(
+    "Analyze the following data and summarize key insights:\n",
+    jsonlite::toJSON(data)
+  )
+
+  analysis <- lg_call_model(list(
+    list(role = "system", content = "You are a data analyst."),
+    list(role = "user", content = prompt)
+  ))
+
+  list(
+    updates = list(analysis = analysis),
+    goto = "report"
+  )
+}
+```
+
+`lg_call_model()` makes the API call directly from R — no Python involved.
+
+---
+
+## Memory
+
+Graphs support the same thread-based memory as assistants. Each run on the same thread ID builds on previous state.
+
+```r
+# First run
+graph$invoke("5", thread_id = "counter_1")
+# state$count = 4
+
+# Second run on same thread — but wait, how does input interact?
+# For graphs, each invoke() sets the 'input' channel fresh,
+# but other state channels persist.
+```
+
+For durable SQLite persistence, use `lg_use_sqlite()` or `lg_set_memory()`:
+
+```r
+# Per-graph SQLite config
+g <- lg_graph("persistent_graph",
+  state = list(value = list(type = "number"))
+) |>
+  lg_add_node("step", step_fn) |>
+  lg_set_memory(db_path = "graph_memory.sqlite") |>
+  lg_compile()
+```
+
+See [Memory & Threads](memory-and-threads.html) for more details.
+
+---
+
+## Multi-Agent Patterns
+
+You can build multi-agent systems by having one graph invoke another, or by nesting an assistant inside a graph node.
+
+```r
+# A graph node that uses an LLM agent
+review_node <- function(state) {
+  draft <- state$draft
+
+  agent <- lg_connect(thread_id = paste0("review_", lg_thread_id()))
+  agent$add_tool(lookup_facts, description = "Look up factual information")
+
+  result <- agent$invoke(paste("Review this draft:", draft))
+
+  list(
+    updates = list(review = result$content),
+    goto = "finalize"
+  )
+}
+```
+
+---
+
+## Limitations
+
+- **Single-path execution** — the current version only supports linear and branching graphs. Parallel fan-out (LangGraph's `Send`) is on the roadmap.
+- **State channel types** — state is JSON-serialized over HTTP. Complex R objects (like model fits) need to be serialized before storing in state.
+- **Max rounds** — graph runs have a safety cap (default 100 node executions per invoke) to prevent infinite loops.
+
+---
+
+## See Also
+
+- [Quick Start](quickstart.html) — get started in 5 minutes
+- [Memory & Threads](memory-and-threads.html) — thread management and persistence
+- [Tools & Models](tools-and-models.html) — calling models from R
+- [Architecture](architecture.html) — how the graph compiler works under the hood

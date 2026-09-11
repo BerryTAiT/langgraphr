@@ -1,0 +1,272 @@
+---
+title: "Architecture"
+description: "How langgraphr works under the hood — the interrupt bridge, server design, and data flow."
+vignette: >
+  %\VignetteIndexEntry{Architecture}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Architecture
+
+langgraphr is an R package that wraps LangGraph — but not in the way you might expect. Instead of calling Python from R (like reticulate), langgraphr runs a hidden Python server as a separate process and talks to it over HTTP. The key innovation is the **interrupt-resume bridge** that lets R code execute inside LangGraph graph nodes.
+
+---
+
+## Three-Layer Architecture
+
+```
+┌─────────────────────────────────────────┐
+│           YOUR R CODE                   │
+│  lg_connect()  lg_graph()  lg_add_node()│
+│  agent$invoke()  graph$invoke()         │
+│  Your R functions (tools, nodes)        │
+└──────────────┬──────────────────────────┘
+               │  JSON over HTTP (127.0.0.1)
+               ▼
+┌─────────────────────────────────────────┐
+│     HIDDEN PYTHON SERVER (FastAPI)      │
+│  app.py      — HTTP endpoints           │
+│  bridge.py   — run/resume orchestration │
+│  runtime.py  — graph building + model   │
+│  registry.py — tool & graph registry    │
+│  Real LangGraph StateGraph engine       │
+│  Real langchain-core / LLM calls        │
+└──────────────┬──────────────────────────┘
+               │  interrupt() / resume
+               ▼
+┌─────────────────────────────────────────┐
+│        R FUNCTION EXECUTION             │
+│  Tools run locally in your R session    │
+│  Graph nodes run locally in R           │
+│  Your data never leaves R memory        │
+└─────────────────────────────────────────┘
+```
+
+The R layer and Python layer communicate only via JSON over localhost HTTP. No R code ever runs in Python, and no Python code (beyond the server itself) is ever written by the user.
+
+---
+
+## The Interrupt-Resume Pattern
+
+The core idea is simple: LangGraph has a built-in `interrupt()` mechanism designed for human-in-the-loop workflows. langgraphr uses this exact same mechanism — but instead of pausing for a human, it pauses for R.
+
+### How a tool call works
+
+```
+R                           Python/LangGraph
+ │                                 │
+ │ POST /runs (input) ───────────► │
+ │                                 │ start run
+ │                                 │ call LLM
+ │                                 │ LLM decides to call tool
+ │                                 │ tools_node() calls interrupt()
+ │                                 │ run PAUSES
+ │ ◄──── status: "interrupted" ────│
+ │    interrupts: [{name, args}]  │
+ │                                 │
+ │ execute R function locally     │
+ │                                 │
+ │ POST /resume (results) ───────►│
+ │                                 │ interrupt() returns results
+ │                                 │ results fed back to LLM
+ │                                 │ LLM produces final answer
+ │ ◄──── status: "completed" ──────│
+ │    content: "..."               │
+```
+
+This works because `interrupt()` is a first-class LangGraph feature. The graph state is preserved across the pause, and execution resumes exactly where it left off.
+
+### Why this approach
+
+| Benefit | Explanation |
+|---|---|
+| **Pure R API** | Users never write or see Python code |
+| **Data stays in R** | Tool arguments and results cross the wire, but your data frames and models stay in R memory |
+| **Real LangGraph** | It is the actual LangGraph engine, not a reimplementation |
+| **Process isolation** | Python and R cannot corrupt each other's memory |
+| **Clean errors** | Python errors are translated to R errors with readable messages |
+| **No reticulate needed** | No in-process Python, no version conflicts, no environment issues |
+
+---
+
+## R Package Structure
+
+The R package (`R/`) contains 10 source files:
+
+| File | Responsibility |
+|---|---|
+| `zzz.R` | Package load/unload hooks, `.lg_env` private state |
+| `server.R` | Start/stop the hidden server, Python discovery, proxy detection |
+| `client.R` | HTTP helpers, retry logic, `lg_call_model()`, `lg_thread_id()` |
+| `agent.R` | `LgAgent` and `LgGraph` R6 classes — the main API |
+| `dsl.R` | Graph builder DSL: `lg_graph()`, `lg_add_node()`, `lg_add_edge()` |
+| `compiler.R` | Compile graph builder → send spec → return `LgGraph` |
+| `schema.R` | Tool schema generation, JSON coercion helpers, state validation |
+| `memory.R` | SQLite config, thread listing, `lg_use_sqlite()` |
+| `relay.R` | Local R HTTP relay (network resilience fallback) |
+| `tour.R` | Interactive guided tour (`lg_tour()`) |
+
+### Package state
+
+A private environment `.lg_env` holds package-wide state:
+
+- `.lg_env$proc` — the `processx` handle of the running server
+- `.lg_env$proxy_mode` — current network route ("system" or "direct")
+- `.lg_env$relay` — local relay server info (if running)
+
+This environment is not exported — users never interact with it directly.
+
+---
+
+## Python Server Structure
+
+The server (`inst/server/`) is a FastAPI application with 5 Python modules:
+
+| File | Responsibility |
+|---|---|
+| `app.py` | FastAPI app — all HTTP endpoints, request/response models |
+| `bridge.py` | Run orchestration — start/resume runs, format results |
+| `runtime.py` | Graph building — assistant graph, developer graphs, model setup, checkpointer |
+| `registry.py` | Process-wide registry of tool schemas and graph specs |
+| `graph_spec.py` | Validation and normalization of graph specs |
+
+### HTTP API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Health check |
+| GET | `/agents` | List available agents (assistant + graphs) |
+| POST | `/tools/register` | Register an R tool schema |
+| GET | `/tools` | List all tool schemas |
+| DELETE | `/tools/{name}` | Remove a tool |
+| POST | `/graphs/register` | Register a graph spec |
+| GET | `/graphs` | List registered graphs |
+| GET | `/threads` | List all thread IDs |
+| POST | `/threads` | Create a new thread |
+| POST | `/threads/{id}/runs` | Start a run (assistant or graph) |
+| POST | `/threads/{id}/resume` | Resume an interrupted run |
+
+### Server lifecycle
+
+1. R calls `lg_start_server()` (or it is auto-started by `lg_connect()` / `lg_compile()`)
+2. R discovers a Python interpreter (bundled venv, uv, or system python)
+3. R spawns uvicorn as a background process via `processx`
+4. R polls `/health` until the server responds
+5. The server runs until R calls `lg_stop_server()` or the R session ends
+6. On package unload (`.onUnload`), R kills the server process at the OS level
+
+---
+
+## Graph Compilation
+
+When you call `lg_compile()`, here is what happens:
+
+1. **R side**: The builder object is validated and converted to a JSON-serialisable spec
+2. **R side**: The spec is POSTed to `/graphs/register`
+3. **Python side**: `validate_graph_spec()` validates the spec thoroughly
+4. **Python side**: The spec is stored in the registry
+5. **Python side**: Any previously compiled version is dropped from cache
+6. **R side**: An `LgGraph` object is returned with the graph ID and node functions
+
+The actual LangGraph `StateGraph` is built **lazily** — on the first run of that graph. This means the server can boot and register graphs without model credentials.
+
+### The graph spec
+
+A graph spec looks like this (as JSON):
+
+```json
+{
+  "graph_id": "demo",
+  "state": {
+    "counter": { "type": "number", "reducer": "overwrite" }
+  },
+  "nodes": [
+    { "id": "inc", "description": "Increment counter" }
+  ],
+  "entry": "inc",
+  "edges": [
+    { "from": "inc", "to": "inc" }
+  ],
+  "defaults": {
+    "inc": "inc"
+  }
+}
+```
+
+This is the full contract between R and Python for the graph authoring path.
+
+---
+
+## Network Resilience
+
+langgraphr includes multiple layers of network resilience for LLM API calls:
+
+### Layer 1: Proxy auto-detection
+
+On startup, the server detects the system proxy from:
+1. `HTTP_PROXY` / `HTTPS_PROXY` environment variables
+2. `LANGGRAPHR_PROXY` override
+3. Windows registry (Internet Settings / ProxyEnable / ProxyServer)
+
+The proxy configuration is passed to the Python server process.
+
+### Layer 2: Route toggling
+
+If a model call fails with a connection error, langgraphr automatically:
+
+1. Stops the server
+2. Restarts it on the alternate route ("direct" if it was using "system proxy", and vice versa)
+3. Retries the request
+
+This handles the common case where a VPN connects or disconnects and changes which network path works.
+
+### Layer 3: R relay fallback
+
+If both routes fail, langgraphr starts a tiny HTTP relay server inside the R process using `httpuv`. The Python server then sends its model requests through the relay:
+
+```
+Python sidecar → localhost relay (R) → LLM API
+```
+
+This works because R's `httr2`/`curl` stack uses the OS TLS stack, which is sometimes unaffected by VPN rules that break Python's TLS connections.
+
+All of this is fully automatic — no configuration needed.
+
+---
+
+## Process Supervision
+
+The hidden server process is carefully managed to prevent orphan processes:
+
+- `processx` supervises the process and kills it when R exits (on supported platforms)
+- On package unload, `.onUnload()` calls `lg_stop_server()`
+- `lg_stop_server()` kills the process tree AND uses OS-level kill (`taskkill` on Windows, `kill -9` on Unix)
+- As a fallback, it also kills any process listening on the server port by PID
+
+This means the server should never survive after R closes, even if the processx handle is lost.
+
+---
+
+## How It Differs from reticulate
+
+| | reticulate | langgraphr |
+|---|---|---|
+| **Core idea** | Bridge — call Python from R | Abstraction — hide Python entirely |
+| **Process model** | In-process (Python inside R) | Out-of-process (separate server) |
+| **Python visibility** | Fully visible — import modules, handle Python objects | Zero — implementation detail |
+| **What you write** | R + Python concepts mixed | Pure R only |
+| **When Python crashes** | Python traceback in R console | Caught, translated to clean R error |
+| **Memory** | Shared between R and Python | Fully isolated |
+| **LangGraph support** | Possible but you write Python LangGraph code | Native — it is the whole point |
+| **Data in R** | Python can hold copies | Yes — only JSON crosses the wire |
+| **VPN / proxy** | Inherits Python's network stack | Auto-detect + retry alternate routes |
+
+---
+
+## See Also
+
+- [Quick Start](quickstart.html) — try it in 5 minutes
+- [FAQ](faq.html) — common questions and troubleshooting
+- [Assistant Agents](assistant-agents.html) — the agent path in detail
+- [Graph Authoring](graph-authoring.html) — the graph path in detail

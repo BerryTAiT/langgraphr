@@ -2,6 +2,9 @@
 Thumbs.db
 .DS_Store
 
+# IDE
+.vscode/
+
 # Python / hidden server runtime
 __pycache__/
 *.pyc
@@ -16,3 +19,22 @@ LanggraphR.Rcheck/
 .RData
 .Rproj.user/
 build/
+
+# App runtime artifacts (databases, uploads, generated PR bundles)
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+uploads/
+patches/
+projects/*/data/
+
+# Generated pkgdown site (rebuild locally with pkgdown::build_site())
+LanggraphR/docs/
+
+# Local scratch scripts and share artifacts
+.trae-html-share-packages/
+debug*.R
+smoke*.R
